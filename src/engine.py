@@ -285,8 +285,11 @@ WEEKLY_DURATION = 7 * 24 * 3600      # 7 дней
 # ════════════════════════════════════════════════════════════════════════════
 #  СИНХРОНИЗАТОР (ФОНОВЫЙ ПОТОК ДЛЯ CLAUDE)
 # ════════════════════════════════════════════════════════════════════════════
-CDP_PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cdp_profiles.json')
-CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+CDP_PROFILES_FILE = os.path.join(os.environ.get('APPDATA', ''), 'AIWidgetDock', 'engine', 'cdp_profiles.json')   # не во временной папке exe: список аккаунтов переживает перезапуск
+os.makedirs(os.path.dirname(CDP_PROFILES_FILE), exist_ok=True)
+CHROME_EXE = next((p for p in (r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'Application', 'chrome.exe')) if os.path.exists(p)),
+                  r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 CHROME_UD = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
 
 
@@ -299,7 +302,7 @@ def load_cdp_profiles():
                 return lst
     except Exception:
         pass
-    return [{'port': 9222, 'profile': 'ClaudeWidget'}, {'port': 9230, 'profile': 'ClaudeWidget2'}]
+    return [{'port': 9222, 'profile': 'ClaudeWidget'}]   # один браузер по умолчанию; второй добавляется через меню аккаунтов
 
 
 def save_cdp_profiles(lst):

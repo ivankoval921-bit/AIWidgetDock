@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.1.1'
+VERSION = '1.2.0'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -36,7 +36,7 @@ DEFAULTS = {'font': 'Segoe UI', 'bold': False, 'italic': False, 'upper': False, 
             'show': {'claude': True, 'codex': True, 'antigravity': True, 'grok': True},
             'chat_line': True, 'sound': True,
             'chat_limit': {'claude': 400, 'codex': 400, 'antigravity': 500, 'grok': 400},
-            'ttl': {'claude': 'auto', 'codex': 'auto'}}
+            'ttl': {'claude': 'auto', 'codex': 'auto'}, 'autostart_init': False, 'lnk_made': False}
 TTLS = [('Авто', 'auto'), ('5 минут', '300'), ('10 минут', '600'), ('1 час', '3600')]
 FONTS = ['Segoe UI', 'Segoe UI Semibold', 'Arial', 'Verdana', 'Tahoma', 'Calibri', 'Consolas', 'Bahnschrift',
          'Trebuchet MS', 'Roboto', 'Cascadia Mono', 'Georgia']
@@ -87,6 +87,70 @@ def proc_running(names, out=None):
         return any(('"%s"' % n) in out for n in names)
     except Exception:
         return False
+
+
+def listen_pids(ports):
+    """PID процессов, слушающих указанные порты (браузеры виджета с remote-debugging)."""
+    import ctypes
+    from ctypes import wintypes
+    res = set()
+    f = ctypes.windll.iphlpapi.GetExtendedTcpTable
+    size = wintypes.DWORD(0)
+    f(None, ctypes.byref(size), False, 2, 3, 0)
+    buf = ctypes.create_string_buffer(size.value + 64)
+    size = wintypes.DWORD(size.value + 64)
+    if f(buf, ctypes.byref(size), False, 2, 3, 0) != 0:
+        return res
+    n = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))[0]
+    arr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))
+    for i in range(n):
+        base = 1 + 6 * i
+        v = arr[base + 2]
+        if (((v & 0xFF) << 8) | ((v >> 8) & 0xFF)) in ports:
+            res.add(arr[base + 5])
+    return res
+
+
+def hide_bridge_windows(ports):
+    """Прячет окна служебных браузеров виджета (свёрнутые / за экраном), чтобы не висели на панели задач.
+    Окно входа в аккаунт (видимое на экране) не трогаем."""
+    import ctypes
+    from ctypes import wintypes
+    pids = listen_pids(ports)
+    if not pids:
+        return
+    u = ctypes.windll.user32
+    WNDENUM = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        try:
+            if u.IsWindowVisible(hwnd):
+                pid = wintypes.DWORD(); u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in pids:
+                    cls = ctypes.create_unicode_buffer(64); u.GetClassNameW(hwnd, cls, 64)
+                    if cls.value == 'Chrome_WidgetWin_1':
+                        r = wintypes.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
+                        if u.IsIconic(hwnd) or r.left <= -30000:
+                            u.ShowWindow(hwnd, 0)
+        except Exception:
+            pass
+        return True
+    u.EnumWindows(WNDENUM(cb), 0)
+
+
+def make_start_shortcut():
+    """Ярлык в меню «Пуск» — запасной способ запустить виджет."""
+    try:
+        if not getattr(sys, 'frozen', False):
+            return
+        lnk = os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'AIWidgetDock.lnk')
+        if os.path.exists(lnk):
+            return
+        ps = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.Save()" % (
+            lnk, sys.executable, os.path.dirname(sys.executable))
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps], creationflags=0x08000000, timeout=30)
+    except Exception as ex:
+        log('start shortcut: %r' % ex)
 
 
 # ---------- данные ----------
@@ -482,6 +546,7 @@ Claude Code и Codex считаются автоматически из журн
 <li><b>Codex</b> — войдите в приложение Codex и сделайте хотя бы один запрос: Codex сам записывает лимиты, виджет их читает.</li>
 <li><b>Antigravity</b> — откройте Antigravity и войдите в аккаунт Google.</li>
 <li><b>Grok</b> — точных лимитов у Grok нет, показывается примерный расход со знаком «~».</li></ul>
+<h4>Работа в фоне</h4><p>Виджет живёт в трее и сам запускается вместе с Windows. Он показывается, только пока запущен хоть один ИИ, и пропадает, когда все закрыты; при следующем запуске ИИ появляется снова. «Свернуть» прячет его до запуска ИИ, «Закрыть полностью» выключает совсем (запуск: меню «Пуск» → AIWidgetDock). Служебные окна браузера для чтения лимитов Claude скрыты и не мешают.</p>
 <h4>Управление</h4><ul><li>Перетащить — левой кнопкой за блок. Клик по строке — подробности: сессия, неделя, окно контекста (где программа его отдаёт).</li>
 <li>Правый клик — меню: Настройки (шрифт, жирность, курсив, размер, масштаб, фон: чёрный / полупрозрачный / без фона), Обновить, Проверить обновление, Инструкция, Выход.</li></ul>
 <p>Настройки и статистика: %APPDATA%\\AIWidgetDock (stats.csv — журнал цифр для проверки расчётов).</p>"""
@@ -500,13 +565,14 @@ class Dock(QWidget):
         self.st = {k: AIState(k, t, QPixmap(icons[k]) if os.path.exists(icons[k]) else QPixmap())
                    for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok'))}
         self.engine = Engine(self.st, self.bus)
-        self.rows = []; self._drag = None; self._moved = False; self._procs = {}
+        self.rows = []; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
         self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(5000)
         self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_all); self.t_codex.start(20000)
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.relayout); self.t_tick.start(30000)
         self.t_blink = QTimer(self); self.t_blink.timeout.connect(self.tick); self.t_blink.start(1000)
+        self.t_hide = QTimer(self); self.t_hide.timeout.connect(self.hide_bridges); self.t_hide.start(3000)
         self.t_stat = QTimer(self); self.t_stat.timeout.connect(lambda: [stat(a, 'hourly') for a in self.st.values() if a.running]); self.t_stat.start(3600000)
-        self.tray = QSystemTrayIcon(QIcon(icons['claude']), self); self.tray.setToolTip('AIWidgetDock'); self.tray.setContextMenu(self.menu()); self.tray.show()
+        self.tray = QSystemTrayIcon(QIcon(icons['claude']), self); self.tray.setToolTip('AIWidgetDock'); self.tray.setContextMenu(self.menu()); self.tray.show(); self.tray.activated.connect(self.on_tray)
         self.check_procs(); self.engine.read_all(); self.relayout()
         if self.cfg['x'] >= 0:
             self.move(self.cfg['x'], self.cfg['y'])
@@ -515,6 +581,10 @@ class Dock(QWidget):
         if self.cfg.get('first_run'):
             self.cfg['first_run'] = False; save_cfg(self.cfg); QTimer.singleShot(800, self.show_readme)
         QTimer.singleShot(15000, lambda: self.check_update(False))
+        if getattr(sys, 'frozen', False) and not self.cfg.get('autostart_init'):   # автозапуск с Windows включён по умолчанию
+            self.cfg['autostart_init'] = True; save_cfg(self.cfg); self.set_autostart(True)
+        if not self.cfg.get('lnk_made'):
+            self.cfg['lnk_made'] = True; save_cfg(self.cfg); threading.Thread(target=make_start_shortcut, daemon=True).start()
         self.t_upd = QTimer(self); self.t_upd.timeout.connect(lambda: self.check_update(False)); self.t_upd.start(6 * 3600 * 1000)   # и дальше раз в 6 часов
 
     def check_procs(self):
@@ -538,6 +608,8 @@ class Dock(QWidget):
             on = bool(self._procs.get(k)) and self.cfg['show'].get(k, True)
             if on != a.running:
                 a.running = on; ch = True; stat(a, 'start' if on else 'stop')
+                if on:
+                    self._user_hidden = False
                 if on:
                     self.engine.start(k)
                 else:
@@ -683,6 +755,12 @@ class Dock(QWidget):
         if not act:
             w, y = fm.horizontalAdvance('ИИ не запущен') + 4 * pad, lh + pad
         self.setFixedSize(int(w), int(y + pad)); self.update()
+        if self._ready:   # окно видно, только пока запущен хоть один ИИ; без ИИ живёт в трее и появится само
+            want = bool(act) and not self._user_hidden
+            if want and not self.isVisible():
+                self.show()
+            elif not want and self.isVisible():
+                self.hide()
 
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
@@ -760,8 +838,31 @@ class Dock(QWidget):
         m.addAction('Папка настроек и статистики', lambda: os.startfile(DATA))
         m.addSeparator()
         m.addAction('Версия ' + VERSION).setEnabled(False)
-        m.addAction('Выход', QApplication.quit)
+        m.addAction('Свернуть (вернётся сам при запуске ИИ)', self.minimize_to_tray)
+        m.addAction('Закрыть полностью', self.quit_full)
         return m
+
+    def hide_bridges(self):
+        try:
+            m = self.engine.mods.get('claude')
+            ports = {int(p['port']) for p in m.load_cdp_profiles()} if m else {9222, 9230}
+            hide_bridge_windows(ports)
+        except Exception as ex:
+            log('hide bridges: %r' % ex)
+
+    def minimize_to_tray(self):
+        self._user_hidden = True; self.hide()
+        self.notify('AIWidgetDock', 'Виджет свёрнут в трей. Появится сам, когда запустится ИИ, или по клику на значок в трее.')
+
+    def on_tray(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._user_hidden = False; self.relayout()
+            if not self.isVisible():
+                self.notify('AIWidgetDock', 'Сейчас ни один ИИ не запущен. Виджет появится сам, когда запустится Claude, Codex или Antigravity.')
+
+    def quit_full(self):
+        if QMessageBox.question(self, APP, 'Закрыть виджет полностью?\nОн снова запустится при входе в Windows или из меню «Пуск».') == QMessageBox.StandardButton.Yes:
+            QApplication.quit()
 
     def show_readme(self):
         d = QDialog(self); d.setWindowTitle('AIWidgetDock — инструкция'); d.resize(560, 560)
@@ -828,7 +929,7 @@ def main():
     ctypes.windll.kernel32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
     if ctypes.windll.kernel32.GetLastError() == 183:
         return
-    d = Dock(); d.show()
+    d = Dock(); d._ready = True; d.relayout()
     sys.exit(app.exec())
 
 
