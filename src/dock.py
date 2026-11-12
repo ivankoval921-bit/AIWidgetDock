@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """AIWidgetDock — компактный виджет лимитов ИИ (Claude, Codex, Antigravity, Grok).
 Один блок: строка ИИ появляется, только пока его программа запущена.
 Движок чтения лимитов — тот же, что у виджетов DesktopClaudeWidget (engine.py)."""
@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.3.1'
+VERSION = '1.3.3'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -716,7 +716,7 @@ class Details(QWidget):
         if a.s_pct is None and a.w_pct is None:
             v.addWidget(QLabel('Нет данных. Правый клик → «Инструкция»: как подключить аккаунт.'))
         h = QHBoxLayout()
-        b1 = QPushButton('Обновить'); b1.clicked.connect(lambda: (dock.engine.refresh(), QTimer.singleShot(2500, lambda: self.build(True))))
+        b1 = QPushButton('Обновить'); b1.clicked.connect(lambda: (dock.engine.refresh(), QTimer.singleShot(2500, lambda: safe_call(self.build, True))))
         b2 = QPushButton('Инструкция'); b2.clicked.connect(lambda: (self.close(), dock.show_readme()))
         h.addWidget(b1); h.addWidget(b2); v.addLayout(h)
         if a.updated:
@@ -911,7 +911,7 @@ class Dock(QWidget):
         self.st = {k: AIState(k, t, QPixmap(icons[k]) if os.path.exists(icons[k]) else QPixmap())
                    for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok'))}
         self.engine = Engine(self.st, self.bus)
-        self.rows = []; self.cells = []; self._seps = []; self._det = {}; self._alarm = {}; self._dbl = False; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
+        self.rows = []; self.cells = []; self._seps = []; self._force_show = False; self._det = {}; self._alarm = {}; self._dbl = False; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
         self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(5000)
         self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_all); self.t_codex.start(20000)
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.relayout); self.t_tick.start(30000)
@@ -1207,9 +1207,9 @@ class Dock(QWidget):
         self.rows = [(c['a'], c['rect']) for c in cells]
         self.setFixedSize(int(w), int(h)); self.update()
         for d in list(self._det.values()):   # открытые подробности обновляются вместе с данными (только если что-то изменилось)
-            d.build()
+            safe_call(d.build)
         if self._ready:   # окно видно, только пока запущен хоть один ИИ; без ИИ живёт в трее и появится само
-            want = bool(act) and not self._user_hidden
+            want = (bool(act) or self._force_show) and not self._user_hidden
             if want and not self.isVisible():
                 self.show()
             elif not want and self.isVisible():
@@ -1323,7 +1323,7 @@ class Dock(QWidget):
 
     def close_details(self):
         for d in list(self._det.values()):
-            d.close()
+            safe_call(d.close)
         self._det.clear()
 
     def open_details(self, a):
@@ -1333,7 +1333,7 @@ class Dock(QWidget):
             return
         d = Details(self, a); d.adjustSize(); self._det[a.key] = d
         if not self.cfg.get('details_pin', True):
-            QTimer.singleShot(8000, d.close)
+            QTimer.singleShot(8000, lambda w=d: safe_call(w.close))
         g = QApplication.primaryScreen().availableGeometry()
         x = min(self.x(), g.right() - d.width()); y = self.y() - d.height() - 6
         if y < g.top():
@@ -1430,14 +1430,12 @@ class Dock(QWidget):
             log('hide bridges: %r' % ex)
 
     def minimize_to_tray(self):
-        self._user_hidden = True; self.hide()
+        self._user_hidden = True; self._force_show = False; self.hide()
         self.notify('AIWidgetDock', 'Виджет свёрнут в трей. Появится сам, когда запустится ИИ, или по клику на значок в трее.')
 
     def on_tray(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._user_hidden = False; self.relayout()
-            if not self.isVisible():
-                self.notify('AIWidgetDock', 'Сейчас ни один ИИ не запущен. Виджет появится сам, когда запустится Claude, Codex или Antigravity.')
+            self._user_hidden = False; self._force_show = True; self.relayout()   # показать даже без запущенных ИИ
 
     def quit_full(self):
         if QMessageBox.question(self, APP, 'Закрыть виджет полностью?\nОн снова запустится при входе в Windows или из меню «Пуск».') == QMessageBox.StandardButton.Yes:
@@ -1603,7 +1601,46 @@ class Dock(QWidget):
                 QMessageBox.warning(self, APP, 'Не удалось проверить обновление: %s' % e)
 
 
+_CRASH_FILE = None
+_EX_COUNT = [0]
+
+
+def safe_call(fn, *args):
+    """Вызов, который не роняет программу, если окно уже закрыто и удалено (RuntimeError: wrapped C/C++ object has been deleted)."""
+    try:
+        fn(*args)
+    except RuntimeError:
+        pass
+    except Exception as ex:
+        log('safe_call: %r' % ex)
+
+
+def install_crash_guards():
+    """PyQt6 при необработанной ошибке Python в обработчике событий вызывает qFatal() и закрывает программу
+    (в Windows это «ошибка в Qt6Core.dll», код 0xc0000409). Свой excepthook отменяет это: ошибка пишется в журнал,
+    программа продолжает работать. faulthandler пишет стек в crash.log, если авария всё же случилась."""
+    import traceback
+    import faulthandler
+
+    def hook(tp, ex, tb):
+        try:
+            _EX_COUNT[0] += 1
+            if _EX_COUNT[0] <= 200:   # чтобы повторяющаяся ошибка не раздувала журнал
+                log('UNHANDLED ' + ''.join(traceback.format_exception(tp, ex, tb))[-1800:])
+        except Exception:
+            pass
+    sys.excepthook = hook
+    threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
+    try:
+        global _CRASH_FILE
+        _CRASH_FILE = open(os.path.join(DATA, 'crash.log'), 'a', encoding='utf-8')
+        faulthandler.enable(_CRASH_FILE)
+    except Exception:
+        pass
+
+
 def main():
+    install_crash_guards()
     app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
     import ctypes
     ctypes.windll.kernel32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
