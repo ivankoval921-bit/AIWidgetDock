@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """AIWidgetDock — компактный виджет лимитов ИИ (Claude, Codex, Antigravity, Grok).
 Один блок: строка ИИ появляется, только пока его программа запущена.
 Движок чтения лимитов — тот же, что у виджетов DesktopClaudeWidget (engine.py)."""
@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -515,6 +515,7 @@ class Dock(QWidget):
         if self.cfg.get('first_run'):
             self.cfg['first_run'] = False; save_cfg(self.cfg); QTimer.singleShot(800, self.show_readme)
         QTimer.singleShot(15000, lambda: self.check_update(False))
+        self.t_upd = QTimer(self); self.t_upd.timeout.connect(lambda: self.check_update(False)); self.t_upd.start(6 * 3600 * 1000)   # и дальше раз в 6 часов
 
     def check_procs(self):
         """Строка ИИ видна, только пока его программа работает."""
@@ -795,6 +796,8 @@ class Dock(QWidget):
             r = json.load(urllib.request.urlopen(req, timeout=10))
             tag = str(r.get('tag_name', '')).lstrip('vV')
             ver = lambda s: tuple(int(x) for x in s.split('.') if x.isdigit())
+            if not manual and getattr(self, '_declined', None) == tag:
+                return
             if not tag or ver(tag) <= ver(VERSION):
                 if manual:
                     QMessageBox.information(self, APP, 'У вас последняя версия %s.' % VERSION)
@@ -802,6 +805,7 @@ class Dock(QWidget):
             notes = (r.get('body') or '').strip() or '—'
             msg = ('Доступна новая версия %s (у вас %s).\n\nЧто нового:\n%s\n• улучшена производительность\n• улучшена обработка данных\n\nОбновить сейчас?' % (tag, VERSION, notes))
             if QMessageBox.question(self, APP, msg) != QMessageBox.StandardButton.Yes:
+                self._declined = tag
                 return
             asset = next((x for x in r.get('assets', []) if x.get('name', '').lower().endswith('.exe')), None)
             if not asset or not getattr(sys, 'frozen', False):
@@ -810,7 +814,7 @@ class Dock(QWidget):
             urllib.request.urlretrieve(asset['browser_download_url'], new)
             bat = os.path.join(tempfile.gettempdir(), 'aiwd_update.bat')
             with open(bat, 'w', encoding='utf-8') as f:
-                f.write('@echo off\r\nchcp 65001 >nul\r\nping 127.0.0.1 -n 3 >nul\r\ncopy /y "%s" "%s" >nul\r\nstart "" "%s"\r\n' % (new, sys.executable, sys.executable))
+                f.write('@echo off\r\nchcp 65001 >nul\r\nset n=0\r\n:r\r\nset /a n+=1\r\nping 127.0.0.1 -n 3 >nul\r\ncopy /y "%s" "%s" >nul 2>&1\r\nif errorlevel 1 if %%n%% LSS 20 goto r\r\nstart "" "%s"\r\n' % (new, sys.executable, sys.executable))
             subprocess.Popen(['cmd', '/c', bat], creationflags=0x08000000); QApplication.quit()
         except Exception as e:
             log('update: %r' % e)
