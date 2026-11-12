@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """AIWidgetDock — компактный виджет лимитов ИИ (Claude, Codex, Antigravity, Grok).
 Один блок: строка ИИ появляется, только пока его программа запущена.
 Движок чтения лимитов — тот же, что у виджетов DesktopClaudeWidget (engine.py)."""
-import sys, os, json, time, glob, csv, threading, subprocess, importlib.util, urllib.request, tempfile
+import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util, urllib.request, tempfile
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -18,7 +18,7 @@ LOG_FILE = os.path.join(DATA, 'dock.log')
 from PyQt6.QtCore import Qt, QTimer, QRectF, QObject, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QFont, QPixmap, QPen, QPainterPath, QFontMetrics, QIcon
 from PyQt6.QtWidgets import (QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-                             QSlider, QCheckBox, QPushButton, QFormLayout, QMessageBox, QTextBrowser, QSystemTrayIcon)
+                             QSlider, QCheckBox, QPushButton, QFormLayout, QMessageBox, QTextBrowser, QSystemTrayIcon, QSpinBox)
 
 
 def log(m):
@@ -33,7 +33,11 @@ def log(m):
 
 DEFAULTS = {'font': 'Segoe UI', 'bold': False, 'italic': False, 'upper': False, 'size': 12, 'scale': 100,
             'icon': 18, 'bg': 'black', 'bg_alpha': 85, 'x': -1, 'y': -1, 'first_run': True,
-            'show': {'claude': True, 'codex': True, 'antigravity': True, 'grok': True}}
+            'show': {'claude': True, 'codex': True, 'antigravity': True, 'grok': True},
+            'chat_line': True, 'sound': True,
+            'chat_limit': {'claude': 400, 'codex': 400, 'antigravity': 500, 'grok': 400},
+            'ttl': {'claude': 'auto', 'codex': 'auto'}}
+TTLS = [('Авто', 'auto'), ('5 минут', '300'), ('10 минут', '600'), ('1 час', '3600')]
 FONTS = ['Segoe UI', 'Segoe UI Semibold', 'Arial', 'Verdana', 'Tahoma', 'Calibri', 'Consolas', 'Bahnschrift',
          'Trebuchet MS', 'Roboto', 'Cascadia Mono', 'Georgia']
 
@@ -68,6 +72,14 @@ def zone_color(pct):
     return QColor(ZONES[min(4, max(0, int(p // 20)))])
 
 
+# ---------- чат: 4 зоны по заполнению окна (доли предела: 150/300/350 из 400) ----------
+TOK_ZONES = ['#2fb35a', '#e0b400', '#f07a16', '#e8203c']
+
+
+def fmt_k(n):
+    return '%dk' % round(n / 1000.0)
+
+
 def proc_running(names, out=None):
     try:
         if out is None:
@@ -88,6 +100,8 @@ class AIState:
         self.approx = False
         self.updated = 0.0
         self.source = ''
+        self.ch_used = None; self.ch_ts = 0.0; self.ch_ttl = 0; self.ch_src = ''   # текущий чат: токены, время последнего хода
+        self.al_ts = 0.0; self.al_beep = 0.0; self.al_zone = -1
 
 
 class Bus(QObject):
@@ -174,7 +188,72 @@ class Engine:
                 w.force_refresh = True
             except Exception:
                 pass
+        self.read_all()
+
+    def read_all(self):
         self.read_codex()
+        self.read_claude_chat()
+
+    def read_claude_chat(self):
+        # Текущий чат Claude Code: ~/.claude/projects/*/*.jsonl — токены и время последнего хода (кэш)
+        a = self.st['claude']
+        try:
+            base = os.path.join(os.path.expanduser('~'), '.claude', 'projects')
+            cands = []
+            for d in os.scandir(base):
+                if not d.is_dir():
+                    continue
+                for e in os.scandir(d.path):
+                    if e.name.endswith('.jsonl'):
+                        cands.append((e.stat().st_mtime, e.path))
+            cands.sort(reverse=True)
+            used = ts = ttl = None
+            best = ''
+            for _, best in cands[:40]:   # самый свежий файл с реальными ходами (пустые и служебные пропускаем)
+                for span in (600000, 6000000):
+                    with open(best, 'rb') as fh:
+                        fh.seek(0, 2); n = fh.tell(); fh.seek(max(0, n - span))
+                        lines = fh.read().decode('utf-8', 'ignore').splitlines()
+                    used = ts = ttl = None
+                    tries = 0
+                    for ln in reversed(lines):
+                        if '"usage"' not in ln:
+                            continue
+                        tries += 1
+                        if tries > 400:
+                            break
+                        try:
+                            d = json.loads(ln)
+                        except ValueError:
+                            continue
+                        m = d.get('message')
+                        u = m.get('usage') if isinstance(m, dict) else None
+                        if not u or d.get('isSidechain') or m.get('model') == '<synthetic>':
+                            continue
+                        tot = sum(int(u.get(x) or 0) for x in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'))
+                        if not tot:
+                            continue
+                        if used is None:
+                            used, ts = tot, iso_ts(d.get('timestamp'))
+                        cc = u.get('cache_creation') or {}
+                        if int(cc.get('ephemeral_1h_input_tokens') or 0) > 0:
+                            ttl = 3600
+                        elif int(cc.get('ephemeral_5m_input_tokens') or 0) > 0:
+                            ttl = 300
+                        if ttl:
+                            break
+                    if used is not None:
+                        break
+                if used is not None:
+                    break
+            if used is None:
+                return
+            a.ch_used, a.ch_ts, a.ch_src = used, ts, os.path.basename(best)
+            if ttl:
+                a.ch_ttl = ttl
+        except Exception as e:
+            log('claude chat: %r' % e)
+        self.bus.changed.emit()
 
     def on_ctx(self, key, d):
         a = self.st[key]
@@ -237,7 +316,7 @@ class Engine:
                 if '"token_count"' not in ln:
                     continue
                 try:
-                    p = json.loads(ln).get('payload') or {}
+                    obj = json.loads(ln); p = obj.get('payload') or {}
                 except ValueError:
                     continue
                 info, rl = p.get('info') or {}, p.get('rate_limits') or {}
@@ -251,6 +330,7 @@ class Engine:
                 if info.get('model_context_window') and lt:
                     a.ctx_used = int(lt.get('input_tokens') or 0) + int(lt.get('output_tokens') or 0)
                     a.ctx_max = int(info['model_context_window'])
+                    a.ch_used = a.ctx_used; a.ch_ts = iso_ts(obj.get('timestamp')); a.ch_src = os.path.basename(f)
                 a.source = 'codex sessions'
                 a.updated = time.time()
                 stat(a)
@@ -283,11 +363,11 @@ class Details(QWidget):
         v = QVBoxLayout(self); v.setContentsMargins(10, 8, 10, 8); v.setSpacing(4)
         v.addWidget(QLabel('<b>%s</b>' % a.title))
 
-        def bar(name, pct, extra):
+        def bar(name, pct, extra, col=None, txt=None):
             if pct is None:
                 return
-            c = zone_color(pct).name()
-            v.addWidget(QLabel('%s: <b style="color:%s">%s%d%%</b>' % (name, c, '~' if a.approx else '', round(pct))))
+            c = col or zone_color(pct).name()
+            v.addWidget(QLabel('%s: <b style="color:%s">%s</b>' % (name, c, txt or ('%s%d%%' % ('~' if a.approx else '', round(pct))))))
             b = QLabel(); b.setFixedHeight(6)
             q = max(0.001, min(0.998, pct / 100.0))
             b.setStyleSheet('background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 %s,stop:%.3f %s,stop:%.3f #2a2d33,stop:1 #2a2d33);border-radius:3px' % (c, q, c, q + 0.001))
@@ -298,6 +378,18 @@ class Details(QWidget):
         bar('Неделя', a.w_pct, ('Сброс: %s' % datetime.fromtimestamp(a.w_reset).strftime('%d.%m в %H:%M')) if a.w_reset else '')
         if a.ctx_used and a.ctx_max:
             bar('Окно контекста', 100.0 * a.ctx_used / a.ctx_max, '%d тыс. из %d тыс. токенов' % (a.ctx_used // 1000, a.ctx_max // 1000))
+        ci = dock.chat_info(a)
+        if ci:
+            warn = ' — пора в новый чат!' if ci['zone'] == 3 else ''
+            bar('Токены в этом чате', min(100.0, 100.0 * ci['used'] / ci['limit']),
+                '%d тыс. из %d тыс. (предел меняется в настройках)%s' % (ci['used'] // 1000, ci['limit'] // 1000, warn),
+                TOK_ZONES[ci['zone']], '%d тыс.' % (ci['used'] // 1000))
+            if ci['state'] == 'dead':
+                v.addWidget(QLabel('Кэш: <b style="color:#8a8f98">остыл</b> — следующий ход заново читает весь чат, это дороже'))
+            elif ci['state']:
+                left = ci['left']
+                bar('Кэш', 100.0 * left / ci['ttl'], 'Осталось %d мин из %d. Любой ход в чате обновляет кэш.' % (round(left / 60), round(ci['ttl'] / 60)),
+                    '#2fb35a' if ci['state'] == 'ok' else '#e8203c', '%d мин' % max(1, round(left / 60)))
         if a.s_pct is None and a.w_pct is None:
             v.addWidget(QLabel('Нет данных. Правый клик → «Инструкция»: как подключить аккаунт.'))
         h = QHBoxLayout()
@@ -332,6 +424,18 @@ class Settings(QDialog):
         self.bg = QComboBox(); self.bg.addItems(['Чёрный', 'Полупрозрачный', 'Без фона (только цифры и значки)'])
         self.bg.setCurrentIndex({'black': 0, 'semi': 1, 'none': 2}.get(c['bg'], 0)); f.addRow('Фон', self.bg)
         self.alpha = sl(0, 100, c['bg_alpha']); f.addRow('Плотность фона, %', self.alpha)
+        self.chat_cb = QCheckBox('Строка чата: токены и кэш'); self.chat_cb.setChecked(c.get('chat_line', True)); self.chat_cb.toggled.connect(self.apply); f.addRow('', self.chat_cb)
+        self.snd_cb = QCheckBox('Звуковой сигнал (кэш остывает / чат заполнен)'); self.snd_cb.setChecked(c.get('sound', True)); self.snd_cb.toggled.connect(self.apply); f.addRow('', self.snd_cb)
+        for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok')):
+            sb = QSpinBox(); sb.setRange(50, 2000); sb.setSingleStep(50); sb.setSuffix(' тыс.')
+            sb.setValue(int(c.get('chat_limit', {}).get(k, DEFAULTS['chat_limit'][k]))); sb.valueChanged.connect(self.apply)
+            setattr(self, 'lim_' + k, sb); f.addRow('Предел чата: ' + t, sb)
+        for k, t in (('claude', 'Claude'), ('codex', 'Codex')):
+            cb = QComboBox()
+            for lab, val in TTLS:
+                cb.addItem(lab, val)
+            cb.setCurrentIndex(max(0, cb.findData(str(c.get('ttl', {}).get(k, 'auto'))))); cb.currentIndexChanged.connect(self.apply)
+            setattr(self, 'ttl_' + k, cb); f.addRow('Срок кэша: ' + t, cb)
         for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok')):
             cb = QCheckBox('Показывать ' + t); cb.setChecked(c['show'].get(k, True)); cb.toggled.connect(self.apply); setattr(self, 'sh_' + k, cb); f.addRow('', cb)
         self.font.currentIndexChanged.connect(self.apply); self.bg.currentIndexChanged.connect(self.apply)
@@ -347,6 +451,9 @@ class Settings(QDialog):
                   'bg_alpha': self.alpha.value()})
         for k in ('claude', 'codex', 'antigravity', 'grok'):
             c['show'][k] = getattr(self, 'sh_' + k).isChecked()
+        c['chat_line'] = self.chat_cb.isChecked(); c['sound'] = self.snd_cb.isChecked()
+        c['chat_limit'] = {k: getattr(self, 'lim_' + k).value() for k in ('claude', 'codex', 'antigravity', 'grok')}
+        c['ttl'] = {k: getattr(self, 'ttl_' + k).currentData() for k in ('claude', 'codex')}
         save_cfg(c); self.dock.check_procs(); self.dock.relayout()
 
     def reset(self):
@@ -363,6 +470,13 @@ README = """<h3>AIWidgetDock — виджет лимитов ИИ</h3>
 <p>Строка ИИ появляется, когда его программа запущена, и пропадает, когда она закрыта.</p>
 <h4>Установка</h4><ol><li>Скопируйте <b>AIWidgetDock.exe</b> в любую папку (например D:\\Programs) и запустите.</li>
 <li>Чтобы запускался вместе с Windows: правый клик по виджету → «Запускать с Windows».</li></ol>
+<h4>Строка «чат» (новое в 1.1)</h4>
+<p>Третья строка показывает <b>текущий чат</b>: «кэш 54м  187k/400k».
+<b>Кэш</b> — сколько ещё минут ИИ читает ваш чат из дешёвой памяти. Каждый ход обновляет отсчёт. Когда остаётся меньше четверти срока, цифра становится красной и мигает,
+за последние минуты появляется «ХОД!» и звуковой сигнал: сделайте любой ход в чате (хоть «подожди, думаю»). Если кэш остыл, следующий ход дороже.
+<b>Токены</b> — заполнение окна чата: зелёный до 150k, жёлтый до 300k, оранжевый до 350k, красный выше (для предела 400k; доли те же при другом пределе).
+В красной зоне цифра мигает: пора переходить в новый чат. Пределы и срок кэша задаются в настройках.
+Claude Code и Codex считаются автоматически из журналов; у остальных токены обновляются кнопкой «Обновить», а кэш-таймера нет.</p>
 <h4>Подключение аккаунтов</h4><ul>
 <li><b>Claude</b> — откройте Claude Desktop и войдите в аккаунт (или войдите на claude.ai в Chrome / Firefox). Виджет найдёт вход сам.</li>
 <li><b>Codex</b> — войдите в приложение Codex и сделайте хотя бы один запрос: Codex сам записывает лимиты, виджет их читает.</li>
@@ -388,11 +502,12 @@ class Dock(QWidget):
         self.engine = Engine(self.st, self.bus)
         self.rows = []; self._drag = None; self._moved = False; self._procs = {}
         self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(5000)
-        self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_codex); self.t_codex.start(20000)
+        self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_all); self.t_codex.start(20000)
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.relayout); self.t_tick.start(30000)
+        self.t_blink = QTimer(self); self.t_blink.timeout.connect(self.tick); self.t_blink.start(1000)
         self.t_stat = QTimer(self); self.t_stat.timeout.connect(lambda: [stat(a, 'hourly') for a in self.st.values() if a.running]); self.t_stat.start(3600000)
         self.tray = QSystemTrayIcon(QIcon(icons['claude']), self); self.tray.setToolTip('AIWidgetDock'); self.tray.setContextMenu(self.menu()); self.tray.show()
-        self.check_procs(); self.engine.read_codex(); self.relayout()
+        self.check_procs(); self.engine.read_all(); self.relayout()
         if self.cfg['x'] >= 0:
             self.move(self.cfg['x'], self.cfg['y'])
         else:
@@ -437,10 +552,109 @@ class Dock(QWidget):
             f.setCapitalization(QFont.Capitalization.AllUppercase)
         return f, k
 
+    GREY = QColor('#9aa0a6')
+
+    def ttl_for(self, a):
+        v = str(self.cfg.get('ttl', {}).get(a.key, 'auto'))
+        if v != 'auto':
+            try:
+                return int(v)
+            except ValueError:
+                pass
+        return (a.ch_ttl or 3600) if a.key == 'claude' else 600
+
+    def chat_info(self, a):
+        """Текущий чат: токены, зона, остаток кэша. None — нечего показывать."""
+        if not self.cfg.get('chat_line', True):
+            return None
+        now = time.time()
+        if a.ch_used and a.ch_ts and now - a.ch_ts <= 12 * 3600:
+            used, ts = a.ch_used, a.ch_ts
+        elif a.key != 'codex' and a.ctx_used:
+            used, ts = a.ctx_used, 0.0
+        else:
+            return None
+        limit = max(1, int(self.cfg.get('chat_limit', {}).get(a.key, 400))) * 1000
+        r = used / float(limit)
+        ci = {'used': used, 'limit': limit, 'zone': 0 if r < 0.375 else 1 if r < 0.75 else 2 if r < 0.875 else 3,
+              'ts': ts, 'ttl': 0, 'left': None, 'state': None}
+        if ts:
+            ttl = self.ttl_for(a); left = ts + ttl - now
+            ci.update(ttl=ttl, left=left, state='dead' if left <= 0 else 'beep' if left <= min(300, ttl * 0.1) else 'warn' if left <= ttl * 0.25 else 'ok')
+        return ci
+
+    def chat_segs(self, ci):
+        tc = QColor(TOK_ZONES[ci['zone']]); segs = []
+        st = ci['state']
+        if st == 'dead':
+            segs.append(('кэш остыл', QColor('#8a8f98'), False)); segs.append(('  ', tc, False))
+        elif st:
+            left = ci['left']
+            t = ('%dм' % -(-int(left) // 60)) if left >= 600 else '%d:%02d' % (int(left) // 60, int(left) % 60)
+            if st == 'beep':
+                segs.append(('ХОД! ' + t, QColor('#e8203c'), True))
+            elif st == 'warn':
+                segs.append(('кэш ' + t, QColor('#e8203c'), True))
+            else:
+                segs.append(('кэш ' + t, QColor('#2fb35a'), False))
+            segs.append(('  ', tc, False))
+        segs.append(('%s/%s%s' % (fmt_k(ci['used']), fmt_k(ci['limit']), '!' if ci['zone'] == 3 else ''), tc, ci['zone'] == 3))
+        return segs
+
     def lines(self, a):
+        """[(цвет точки, [(текст, цвет, мигает)], инфо чата)]"""
         ap = '~' if a.approx else ''
-        return [('%s%d%%' % (ap, round(a.s_pct)) if a.s_pct is not None else '—', fmt_left(a.s_reset) if a.s_reset else '', a.s_pct),
-                ('%s%d%%' % (ap, round(a.w_pct)) if a.w_pct is not None else '—', fmt_date(a.w_reset), a.w_pct)]
+
+        def one(pct, sub):
+            t = ('%s%d%%' % (ap, round(pct)) if pct is not None else '—') + ('  ' + sub if sub else '')
+            c = zone_color(pct) if pct is not None else self.GREY
+            return (c, [(t, c, False)], None)
+        L = [one(a.s_pct, fmt_left(a.s_reset) if a.s_reset else ''), one(a.w_pct, fmt_date(a.w_reset))]
+        ci = self.chat_info(a)
+        if ci:
+            L.append((QColor(TOK_ZONES[ci['zone']]), self.chat_segs(ci), ci))
+        return L
+
+    def beep(self, n=2):
+        if not self.cfg.get('sound', True):
+            return
+
+        def run():
+            try:
+                import winsound
+                for _ in range(n):
+                    winsound.Beep(1000, 170); time.sleep(0.08)
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+    def notify(self, title, msg):
+        try:
+            self.tray.showMessage(title, msg, QSystemTrayIcon.MessageIcon.Warning, 8000)
+        except Exception:
+            pass
+
+    def tick(self):
+        """Раз в секунду: мигание, отсчёт кэша, сигналы."""
+        if not any(a.running for a in self.st.values()):
+            return
+        self.update()
+        now = time.time()
+        for a in self.st.values():
+            if not a.running:
+                continue
+            ci = self.chat_info(a)
+            if not ci:
+                continue
+            if ci['state'] == 'beep':
+                if a.al_ts != ci['ts']:
+                    a.al_ts = ci['ts']; a.al_beep = 0.0
+                    self.notify(a.title, 'Кэш скоро остынет — сделайте любой ход в чате.')
+                if now - a.al_beep >= 60:
+                    a.al_beep = now; self.beep()
+            if ci['zone'] == 3 and a.al_zone != 3:
+                self.notify(a.title, 'Чат заполнен: %s из %s. Переходите в новый чат.' % (fmt_k(ci['used']), fmt_k(ci['limit']))); self.beep(1)
+            a.al_zone = ci['zone']
 
     def metrics(self):
         f, k = self.fonts(); fm = QFontMetrics(f)
@@ -450,11 +664,19 @@ class Dock(QWidget):
         f, k, fm, lh, ic, pad, gap, dot = self.metrics()
         self.rows = []; y = pad; w = 0
         act = [self.st[x] for x in self.ORDER if self.st[x].running]
+        norm = lambda t: re.sub(r'\d', '8', t)
         for i, a in enumerate(act):
             if i:
                 y += gap
-            h = max(ic, 2 * lh)
-            txtw = max(fm.horizontalAdvance(p + ('  ' + s if s else '')) for p, s, _ in self.lines(a))
+            L = self.lines(a)
+            h = max(ic, len(L) * lh)
+            txtw = 0
+            for _, segs, ci in L:
+                if ci and ci['state']:   # место под самый длинный вариант «ХОД! 8:88»
+                    tw = fm.horizontalAdvance('ХОД! 8:88') + sum(fm.horizontalAdvance(norm(t)) for t, _, _ in segs[1:])
+                else:
+                    tw = sum(fm.horizontalAdvance(norm(t)) for t, _, _ in segs)
+                txtw = max(txtw, tw)
             self.rows.append((a, y, h)); w = max(w, pad + ic + gap + dot + int(4 * k) + txtw + pad + 2)
             y += h
         if not act:
@@ -464,6 +686,7 @@ class Dock(QWidget):
     def paintEvent(self, e):
         p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         f, k, fm, lh, ic, pad, gap, dot = self.metrics(); p.setFont(f)
+        blink_on = int(time.time()) % 2 == 0
         bg = self.cfg['bg']
         if bg != 'none':
             al = 235 if bg == 'black' else int(255 * self.cfg['bg_alpha'] / 100)
@@ -479,18 +702,22 @@ class Dock(QWidget):
             if not a.icon.isNull():
                 p.drawPixmap(pad, int(y + (h - ic) / 2), a.icon.scaled(ic, ic, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             x0 = pad + ic + gap
-            for j, (pc, sub, val) in enumerate(self.lines(a)):
-                ly = y + (h - 2 * lh) / 2 + j * lh
-                col = zone_color(val) if val is not None else QColor('#9aa0a6')
-                p.setPen(Qt.PenStyle.NoPen); p.setBrush(col); p.drawEllipse(QRectF(x0, ly + (lh - dot) / 2, dot, dot))
-                txt = pc + ('  ' + sub if sub else '')
+            L = self.lines(a); n = len(L)
+            for j, (dcol, segs, _) in enumerate(L):
+                ly = y + (h - n * lh) / 2 + j * lh
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(dcol); p.drawEllipse(QRectF(x0, ly + (lh - dot) / 2, dot, dot))
                 tx = x0 + dot + int(4 * k); base = ly + (lh + fm.ascent() - fm.descent()) / 2
-                if bg == 'none':   # без фона — тёмный контур, чтобы цифры читались на любых обоях
-                    path = QPainterPath(); path.addText(tx, base, f, txt)
-                    p.setPen(QPen(QColor(0, 0, 0, 220), max(2.0, 2.5 * k))); p.setBrush(Qt.BrushStyle.NoBrush); p.drawPath(path)
-                    p.setPen(Qt.PenStyle.NoPen); p.setBrush(col); p.drawPath(path)
-                else:
-                    p.setPen(col); p.drawText(int(tx), int(base), txt)
+                for txt, col, blk in segs:
+                    c = QColor(col)
+                    if blk and not blink_on:
+                        c.setAlpha(70)
+                    if bg == 'none':   # без фона — тёмный контур, чтобы цифры читались на любых обоях
+                        path = QPainterPath(); path.addText(tx, base, f, txt)
+                        p.setPen(QPen(QColor(0, 0, 0, 220 if c.alpha() > 100 else 60), max(2.0, 2.5 * k))); p.setBrush(Qt.BrushStyle.NoBrush); p.drawPath(path)
+                        p.setPen(Qt.PenStyle.NoPen); p.setBrush(c); p.drawPath(path)
+                    else:
+                        p.setPen(c); p.drawText(int(tx), int(base), txt)
+                    tx += fm.horizontalAdvance(txt)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -524,7 +751,7 @@ class Dock(QWidget):
     def menu(self):
         m = QMenu(self)
         m.addAction('Настройки…', lambda: Settings(self).exec())
-        m.addAction('Обновить данные', self.engine.refresh)
+        m.addAction('Обновить данные и токены чата', self.engine.refresh)
         m.addSeparator()
         a = m.addAction('Запускать с Windows'); a.setCheckable(True); a.setChecked(self.autostart_on()); a.toggled.connect(self.set_autostart)
         m.addAction('Проверить обновление', lambda: self.check_update(True))
