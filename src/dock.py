@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """AIWidgetDock — компактный виджет лимитов ИИ (Claude, Codex, Antigravity, Grok).
 Один блок: строка ИИ появляется, только пока его программа запущена.
 Движок чтения лимитов — тот же, что у виджетов DesktopClaudeWidget (engine.py)."""
@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.2.1'
+VERSION = '1.2.2'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
