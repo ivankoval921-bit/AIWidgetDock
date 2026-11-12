@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -915,8 +915,11 @@ class Dock(QWidget):
             urllib.request.urlretrieve(asset['browser_download_url'], new)
             bat = os.path.join(tempfile.gettempdir(), 'aiwd_update.bat')
             with open(bat, 'w', encoding='utf-8') as f:
-                f.write('@echo off\r\nchcp 65001 >nul\r\nset n=0\r\n:r\r\nset /a n+=1\r\nping 127.0.0.1 -n 3 >nul\r\ncopy /y "%s" "%s" >nul 2>&1\r\nif errorlevel 1 if %%n%% LSS 20 goto r\r\nstart "" "%s"\r\n' % (new, sys.executable, sys.executable))
-            subprocess.Popen(['cmd', '/c', bat], creationflags=0x08000000); QApplication.quit()
+                f.write('@echo off\r\nchcp 65001 >nul\r\nset n=0\r\n:r\r\nset /a n+=1\r\nping 127.0.0.1 -n 4 >nul\r\ncopy /y "%s" "%s" >nul 2>&1\r\nif errorlevel 1 if %%n%% LSS 20 goto r\r\nstart "" "%s"\r\n' % (new, sys.executable, sys.executable))
+            # новый exe не должен наследовать переменные PyInstaller старого (иначе «Failed to load Python DLL»)
+            env = {k: v for k, v in os.environ.items() if not (k.startswith('_PYI') or k == '_MEIPASS2')}
+            env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            subprocess.Popen(['cmd', '/c', bat], creationflags=0x08000000, env=env); QApplication.quit()
         except Exception as e:
             log('update: %r' % e)
             if manual:
