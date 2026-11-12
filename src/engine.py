@@ -302,7 +302,8 @@ def load_cdp_profiles():
                 return lst
     except Exception:
         pass
-    return [{'port': 9222, 'profile': 'ClaudeWidget'}]   # один браузер по умолчанию; второй добавляется через меню аккаунтов
+    base = [{'port': 9222, 'profile': 'ClaudeWidget'}, {'port': 9230, 'profile': 'ClaudeWidget2'}]   # оба браузера виджета, даже если файл списка потерян
+    return [x for x in base if x['port'] == 9222 or os.path.isdir(os.path.join(CHROME_UD, x['profile']))]
 
 
 def save_cdp_profiles(lst):
@@ -345,7 +346,7 @@ def cdp_fetch_json(port, path, timeout=8):
     return json.loads(v['b'])
 
 
-ANCHORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reset_anchors.json')
+ANCHORS_FILE = os.path.join(os.environ.get('APPDATA', ''), 'AIWidgetDock', 'engine', 'reset_anchors.json')   # не во временной папке exe: иначе времена сброса терялись при каждом перезапуске
 
 
 def _load_anchors():
@@ -563,7 +564,7 @@ class ClaudeSyncWorker(QThread):
 
             # 1. Периодическое сканирование всех куки-файлов (каждые 30 секунд)
             _fast = os.path.exists(os.path.join(os.environ.get('TEMP', '.'), 'claude_widget_login.flag'))
-            if now - last_scan_time >= (5 if _fast else 30) or not self.all_sessions:
+            if now - last_scan_time >= (5 if (_fast or not self.all_sessions) else 30):   # без аккаунтов — раз в 5 с, а не каждую секунду (грузило процессор)
                 last_scan_time = now
                 self.ensure_bridge()
                 found_raw = self.find_all_sessions()
@@ -719,7 +720,7 @@ class ClaudeSyncWorker(QThread):
                         _f, _w = estimate_resets(d_org)
                         _iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat() if t else ''
                         self.usage_fetched.emit({'five_hour': {'utilization': d_u.get('fh', 0), 'resets_at': _iso(_f)},
-                                                 'seven_day': {'utilization': d_u.get('sd', 0), 'resets_at': _iso(_w)}})
+                                                 'seven_day': {'utilization': d_u.get('sd', 0), 'resets_at': _iso(_w)}, '_file': True, '_ts': d_t})
                         self.error_status.emit('~' + time.strftime('%H:%M', time.localtime(d_t)))
                     if self._report_pending and last_scan_time:
                         self._report_pending = False

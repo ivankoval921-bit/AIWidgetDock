@@ -5,3 +5,6 @@ __pycache__/
 
 _*.py
 _*.png
+Release_*/
+Test_Update/
+Versions/

@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.2.2'
+VERSION = '1.2.3'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -15,7 +15,7 @@ CFG_FILE = os.path.join(DATA, 'settings.json')
 STATS_FILE = os.path.join(DATA, 'stats.csv')
 LOG_FILE = os.path.join(DATA, 'dock.log')
 
-from PyQt6.QtCore import Qt, QTimer, QRectF, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QObject, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QFont, QPixmap, QPen, QPainterPath, QFontMetrics, QIcon
 from PyQt6.QtWidgets import (QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
                              QSlider, QCheckBox, QPushButton, QFormLayout, QMessageBox, QTextBrowser, QSystemTrayIcon, QSpinBox)
@@ -61,7 +61,7 @@ def save_cfg(c):
 
 
 # ---------- шкала: 5 зон по 20% (израсходовано) ----------
-ZONES = ['#2fb35a', '#3b82d6', '#e0b400', '#f07a16', '#e8203c']
+ZONES = ['#2fb35a', '#e0b400', '#f07a16', '#e8203c']
 
 
 def zone_color(pct):
@@ -69,7 +69,27 @@ def zone_color(pct):
         p = float(pct)
     except Exception:
         return QColor('#9aa0a6')
-    return QColor(ZONES[min(4, max(0, int(p // 20)))])
+    return QColor(ZONES[0 if p < 25 else 1 if p < 55 else 2 if p < 90 else 3])   # 0–25 зелёная, 25–55 жёлтая, 55–90 оранжевая, 90+ красная
+
+
+# ---------- плавные цвета столбиков в окне подробностей: (процент, цвет) ----------
+LIM_STOPS = [(0, '#2fb35a'), (18, '#2fb35a'), (32, '#e0b400'), (50, '#e0b400'), (62, '#f07a16'), (82, '#f07a16'), (92, '#e8203c')]
+TOK_STOPS = [(0, '#2fb35a'), (30, '#2fb35a'), (40, '#e0b400'), (62, '#e0b400'), (75, '#f07a16'), (82, '#f07a16'), (90, '#e8203c')]
+CACHE_STOPS = [(0, '#2fb35a'), (35, '#2fb35a'), (50, '#e0b400'), (65, '#e0b400'), (75, '#f07a16'), (83, '#f07a16'), (90, '#e8203c')]   # по доле ушедшего времени
+
+
+def smooth_color(pct, stops):
+    try:
+        p = float(pct)
+    except Exception:
+        return QColor('#9aa0a6')
+    if p <= stops[0][0]:
+        return QColor(stops[0][1])
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if p <= p1:
+            t = (p - p0) / float(p1 - p0); a = QColor(c0); b = QColor(c1)
+            return QColor(int(a.red() + (b.red() - a.red()) * t), int(a.green() + (b.green() - a.green()) * t), int(a.blue() + (b.blue() - a.blue()) * t))
+    return QColor(stops[-1][1])
 
 
 # ---------- чат: 4 зоны по заполнению окна (доли предела: 150/300/350 из 400) ----------
@@ -165,6 +185,7 @@ class AIState:
         self.updated = 0.0
         self.source = ''
         self.ch_used = None; self.ch_ts = 0.0; self.ch_ttl = 0; self.ch_src = ''   # текущий чат: токены, время последнего хода
+        self.ch_approx = False   # токены оценены по длине текста (Claude Desktop), а не взяты из журнала
         self.al_ts = 0.0; self.al_beep = 0.0; self.al_zone = -1
 
 
@@ -215,6 +236,7 @@ class Engine:
         self.st, self.bus = states, bus
         self.workers = {}
         self.mods = {}
+        self.sessions = []
 
     def start(self, key):
         if key in self.workers or key == 'codex':
@@ -227,6 +249,7 @@ class Engine:
                 w.context_path = ''
                 w.context_auto = True
                 w.context_updated.connect(lambda d, k=key: self.on_ctx(k, d))
+                w.sessions_updated.connect(lambda lst: setattr(self, 'sessions', list(lst)))   # аккаунты для меню «Выбрать аккаунт»
             elif key == 'grok':
                 w = m.GrokSyncWorker()
             else:
@@ -257,6 +280,75 @@ class Engine:
     def read_all(self):
         self.read_codex()
         self.read_claude_chat()
+        self.read_claude_web()
+
+    @staticmethod
+    def _est_tokens(obj):
+        """Грубая оценка токенов по тексту: кириллица ~2,2 символа на токен, остальное ~3,8."""
+        cyr = oth = 0
+        stack = [obj]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, str):
+                for ch in x:
+                    if '\u0400' <= ch <= '\u04ff':
+                        cyr += 1
+                    else:
+                        oth += 1
+            elif isinstance(x, list):
+                stack.extend(x)
+            elif isinstance(x, dict):
+                for k, v in x.items():
+                    if k in ('text', 'thinking', 'input', 'content', 'partial_json') or isinstance(v, (list, dict)):
+                        stack.append(v)
+        return int(cyr / 2.2 + oth / 3.8)
+
+    def read_claude_web(self):
+        """Чаты Claude Desktop на ПК не пишутся. Берём последний чат с claude.ai через браузер виджета:
+        время хода — точное (кэш живёт около часа после хода), токены — оценка по длине текста (знак ~)."""
+        a = self.st['claude']
+        now = time.time()
+        if not a.running or now - getattr(self, '_web_ts', 0) < 60 or getattr(self, '_web_busy', False):
+            return
+        if a.ch_used and a.ch_ts and now - a.ch_ts < 900 and not a.ch_approx:
+            return   # есть свежий точный журнал Claude Code
+        self._web_ts = now; self._web_busy = True
+
+        def run():
+            try:
+                m = self.mods.get('claude')
+                if not m:
+                    return
+                best = None   # самый свежий чат среди всех аккаунтов, в которые вошли браузеры виджета
+                for pr in m.load_cdp_profiles():
+                    try:
+                        orgs = m.cdp_fetch_json(pr['port'], '/api/organizations')
+                        for o in orgs:
+                            ou = o.get('uuid')
+                            if not ou:
+                                continue
+                            lst = m.cdp_fetch_json(pr['port'], '/api/organizations/%s/chat_conversations?limit=5' % ou)
+                            for c in lst:
+                                ts = iso_ts(c.get('updated_at'))
+                                if best is None or ts > best[0]:
+                                    best = (ts, pr['port'], ou, c.get('uuid'))
+                    except Exception as ex:
+                        log('claude web %s: %r' % (pr.get('port'), ex))
+                if not best or not best[3]:
+                    return
+                ts, port, ou, cu = best
+                conv = m.cdp_fetch_json(port, '/api/organizations/%s/chat_conversations/%s?tree=True&rendering_mode=messages&render_all_tools=true' % (ou, cu), timeout=20)
+                msgs = conv.get('chat_messages') or []
+                last = max([iso_ts(x.get('created_at')) for x in msgs] + [ts]) if msgs else ts
+                tok = self._est_tokens([x.get('content') or x.get('text') for x in msgs])
+                if tok and last and (not a.ch_ts or last >= a.ch_ts):
+                    a.ch_used, a.ch_ts, a.ch_src, a.ch_approx = tok, last, 'claude.ai ~', True
+                    self.bus.changed.emit()
+            except Exception as ex:
+                log('claude web: %r' % ex)
+            finally:
+                self._web_busy = False
+        threading.Thread(target=run, daemon=True).start()
 
     def read_claude_chat(self):
         # Текущий чат Claude Code: ~/.claude/projects/*/*.jsonl — токены и время последнего хода (кэш)
@@ -312,7 +404,8 @@ class Engine:
                     break
             if used is None:
                 return
-            a.ch_used, a.ch_ts, a.ch_src = used, ts, os.path.basename(best)
+            if not (a.ch_approx and a.ch_ts > (ts or 0)):   # оценку из браузера не затираем более старым журналом
+                a.ch_used, a.ch_ts, a.ch_src, a.ch_approx = used, ts, os.path.basename(best), False
             if ttl:
                 a.ch_ttl = ttl
         except Exception as e:
@@ -337,6 +430,11 @@ class Engine:
                     a.s_pct = float(fh.get('utilization') or 0); a.s_reset = iso_ts(fh.get('resets_at'))
                     a.w_pct = float(sd.get('utilization') or 0); a.w_reset = iso_ts(sd.get('resets_at'))
                     a.source = 'claude api'
+                    if d.get('_file'):
+                        a.source = 'файл Claude Desktop ~' + datetime.fromtimestamp(d.get('_ts') or 0).strftime('%H:%M') + ' — войдите в этот аккаунт в браузере виджета'
+                        a.approx = True
+                    else:
+                        a.approx = False
             elif key == 'antigravity':
                 resp = d.get('response') or {}
                 for g in resp.get('groups', []) or []:
@@ -421,16 +519,32 @@ def fmt_date(ts):
 # ---------- окно подробностей ----------
 class Details(QWidget):
     def __init__(self, dock, a):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Popup)
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)   # не Popup: Popup гаснет при любой смене активного окна
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setStyleSheet('QWidget{background:#0d0f12;color:#ddd;font:12px "Segoe UI"} QPushButton{background:#1b1e23;border:1px solid #444;border-radius:4px;padding:3px 8px}')
-        v = QVBoxLayout(self); v.setContentsMargins(10, 8, 10, 8); v.setSpacing(4)
+        self.dock = dock; self.a = a
+        self.v = QVBoxLayout(self); self.v.setContentsMargins(10, 8, 10, 8); self.v.setSpacing(4)
+        self.build()
+
+    @staticmethod
+    def _clear(lay):
+        while lay.count():
+            it = lay.takeAt(0); w = it.widget(); sub = it.layout()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+            elif sub is not None:
+                Details._clear(sub)
+
+    def build(self):
+        """Заполнить окно свежими цифрами (вызывается при открытии и при обновлении данных)."""
+        dock, a, v = self.dock, self.a, self.v
+        self._clear(v)
         v.addWidget(QLabel('<b>%s</b>' % a.title))
 
         def bar(name, pct, extra, col=None, txt=None):
             if pct is None:
                 return
-            c = col or zone_color(pct).name()
+            c = col or smooth_color(pct, LIM_STOPS).name()
             v.addWidget(QLabel('%s: <b style="color:%s">%s</b>' % (name, c, txt or ('%s%d%%' % ('~' if a.approx else '', round(pct))))))
             b = QLabel(); b.setFixedHeight(6)
             q = max(0.001, min(0.998, pct / 100.0))
@@ -447,21 +561,30 @@ class Details(QWidget):
             warn = ' — пора в новый чат!' if ci['zone'] == 3 else ''
             bar('Токены в этом чате', min(100.0, 100.0 * ci['used'] / ci['limit']),
                 '%d тыс. из %d тыс. (предел меняется в настройках)%s' % (ci['used'] // 1000, ci['limit'] // 1000, warn),
-                TOK_ZONES[ci['zone']], '%d тыс.' % (ci['used'] // 1000))
+                smooth_color(min(100.0, 100.0 * ci['used'] / ci['limit']), TOK_STOPS).name(), '%s%d тыс.' % ('~' if ci.get('approx') else '', ci['used'] // 1000))
             if ci['state'] == 'dead':
                 v.addWidget(QLabel('Кэш: <b style="color:#8a8f98">остыл</b> — следующий ход заново читает весь чат, это дороже'))
             elif ci['state']:
                 left = ci['left']
                 bar('Кэш', 100.0 * left / ci['ttl'], 'Осталось %d мин из %d. Любой ход в чате обновляет кэш.' % (round(left / 60), round(ci['ttl'] / 60)),
-                    '#2fb35a' if ci['state'] == 'ok' else '#e8203c', '%d мин' % max(1, round(left / 60)))
+                    smooth_color(100.0 - 100.0 * max(0.0, left) / ci['ttl'], CACHE_STOPS).name(), '%d мин' % max(1, round(left / 60)))
         if a.s_pct is None and a.w_pct is None:
             v.addWidget(QLabel('Нет данных. Правый клик → «Инструкция»: как подключить аккаунт.'))
         h = QHBoxLayout()
-        b1 = QPushButton('Обновить'); b1.clicked.connect(lambda: (dock.engine.refresh(), self.close()))
+        b1 = QPushButton('Обновить'); b1.clicked.connect(lambda: (dock.engine.refresh(), QTimer.singleShot(2500, self.build)))
         b2 = QPushButton('Инструкция'); b2.clicked.connect(lambda: (self.close(), dock.show_readme()))
         h.addWidget(b1); h.addWidget(b2); v.addLayout(h)
         if a.updated:
             u = QLabel('Обновлено %s · %s' % (datetime.fromtimestamp(a.updated).strftime('%H:%M:%S'), a.source)); u.setStyleSheet('color:#666;font-size:10px'); v.addWidget(u)
+        self.adjustSize()
+
+    def mouseDoubleClickEvent(self, e):   # двойной клик по окну подробностей — свернуть
+        self.close()
+
+    def closeEvent(self, e):
+        if self.dock._det.get(self.a.key) is self:
+            self.dock._det.pop(self.a.key, None)
+        super().closeEvent(e)
 
 
 # ---------- настройки ----------
@@ -530,17 +653,17 @@ README = """<h3>AIWidgetDock — виджет лимитов ИИ</h3>
 <p>Маленький блок на рабочем столе. Для каждого запущенного ИИ — две строки:
 <b>верхняя</b> — 5-часовой лимит (процент и сколько осталось до сброса: 2:15 = 2 ч 15 мин),
 <b>нижняя</b> — недельный лимит (процент, дата и час сброса).
-Цвет: зелёный 0–20%, синий 20–40%, жёлтый 40–60%, оранжевый 60–80%, красный 80–100%.</p>
+Справа от каждой строки — тонкая линия: её длина равна проценту. Цвет цифр и линии: зелёный 0–25%, жёлтый 25–55%, оранжевый 55–90%, красный от 90%. Линии можно выключить в меню правой кнопки.</p>
 <p>Строка ИИ появляется, когда его программа запущена, и пропадает, когда она закрыта.</p>
 <h4>Установка</h4><ol><li>Скопируйте <b>AIWidgetDock.exe</b> в любую папку (например D:\\Programs) и запустите.</li>
 <li>Чтобы запускался вместе с Windows: правый клик по виджету → «Запускать с Windows».</li></ol>
 <h4>Строка «чат» (новое в 1.1)</h4>
 <p>Третья строка показывает <b>текущий чат</b>: «кэш 54м  187k/400k».
 <b>Кэш</b> — сколько ещё минут ИИ читает ваш чат из дешёвой памяти. Каждый ход обновляет отсчёт. Когда остаётся меньше четверти срока, цифра становится красной и мигает,
-за последние минуты появляется «ХОД!» и звуковой сигнал: сделайте любой ход в чате (хоть «подожди, думаю»). Если кэш остыл, следующий ход дороже.
+за последние минуты появляется «ХОД!»: до 10 раз с интервалом 5 секунд звучит сигнал. Клик по виджету останавливает сигнал. Сделайте любой ход в чате (хоть «подожди, думаю»). Если кэш остыл, следующий ход дороже.
 <b>Токены</b> — заполнение окна чата: зелёный до 150k, жёлтый до 300k, оранжевый до 350k, красный выше (для предела 400k; доли те же при другом пределе).
 В красной зоне цифра мигает: пора переходить в новый чат. Пределы и срок кэша задаются в настройках.
-Claude Code и Codex считаются автоматически из журналов; у остальных токены обновляются кнопкой «Обновить», а кэш-таймера нет.</p>
+Claude Code и Codex считаются автоматически из журналов. Для чатов Claude Desktop журнала на ПК нет: виджет берёт последний чат с claude.ai через свой браузер. Время хода (и кэш-таймер) точное, токены — оценка по длине текста, помечена знаком «~». У остальных токены обновляются кнопкой «Обновить», а кэш-таймера нет.</p>
 <h4>Подключение аккаунтов</h4><ul>
 <li><b>Claude</b> — откройте Claude Desktop и войдите в аккаунт (или войдите на claude.ai в Chrome / Firefox). Виджет найдёт вход сам.</li>
 <li><b>Codex</b> — войдите в приложение Codex и сделайте хотя бы один запрос: Codex сам записывает лимиты, виджет их читает.</li>
@@ -548,7 +671,8 @@ Claude Code и Codex считаются автоматически из журн
 <li><b>Grok</b> — точных лимитов у Grok нет, показывается примерный расход со знаком «~».</li></ul>
 <h4>Работа в фоне</h4><p>Виджет живёт в трее и сам запускается вместе с Windows. Он показывается, только пока запущен хоть один ИИ, и пропадает, когда все закрыты; при следующем запуске ИИ появляется снова. «Свернуть» прячет его до запуска ИИ, «Закрыть полностью» выключает совсем (запуск: меню «Пуск» → AIWidgetDock). Служебные окна браузера для чтения лимитов Claude скрыты и не мешают.</p>
 <h4>Управление</h4><ul><li>Перетащить — левой кнопкой за блок. Клик по строке — подробности: сессия, неделя, окно контекста (где программа его отдаёт).</li>
-<li>Правый клик — меню: Настройки (шрифт, жирность, курсив, размер, масштаб, фон: чёрный / полупрозрачный / без фона), Обновить, Проверить обновление, Инструкция, Выход.</li></ul>
+<li>Двойной клик по виджету или по окну подробностей закрывает подробности; повторный клик по той же строке тоже. Окно подробностей держится открытым и обновляется само.</li>
+<li>Правый клик — меню: Настройки (шрифт, жирность, курсив, размер, масштаб, фон: чёрный / полупрозрачный / без фона), Обновить, «Подробности: держать открытыми», «Линии-индикаторы справа», «Выбрать аккаунт Claude» (авто или конкретный), «Аккаунты: подключить / переключить» (вход в ещё один аккаунт Claude через браузер), «Закрепить положение», Проверить обновление, Инструкция, «Свернуть», «Закрыть полностью».</li></ul>
 <p>Настройки и статистика: %APPDATA%\\AIWidgetDock (stats.csv — журнал цифр для проверки расчётов).</p>"""
 
 
@@ -565,7 +689,7 @@ class Dock(QWidget):
         self.st = {k: AIState(k, t, QPixmap(icons[k]) if os.path.exists(icons[k]) else QPixmap())
                    for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok'))}
         self.engine = Engine(self.st, self.bus)
-        self.rows = []; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
+        self.rows = []; self._det = {}; self._alarm = {}; self._dbl = False; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
         self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(5000)
         self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_all); self.t_codex.start(20000)
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.relayout); self.t_tick.start(30000)
@@ -650,7 +774,7 @@ class Dock(QWidget):
         limit = max(1, int(self.cfg.get('chat_limit', {}).get(a.key, 400))) * 1000
         r = used / float(limit)
         ci = {'used': used, 'limit': limit, 'zone': 0 if r < 0.375 else 1 if r < 0.75 else 2 if r < 0.875 else 3,
-              'ts': ts, 'ttl': 0, 'left': None, 'state': None}
+              'ts': ts, 'ttl': 0, 'left': None, 'state': None, 'approx': bool(a.ch_approx and ts)}
         if ts:
             ttl = self.ttl_for(a); left = ts + ttl - now
             ci.update(ttl=ttl, left=left, state='dead' if left <= 0 else 'beep' if left <= min(300, ttl * 0.1) else 'warn' if left <= ttl * 0.25 else 'ok')
@@ -671,7 +795,7 @@ class Dock(QWidget):
             else:
                 segs.append(('кэш ' + t, QColor('#2fb35a'), False))
             segs.append(('  ', tc, False))
-        segs.append(('%s/%s%s' % (fmt_k(ci['used']), fmt_k(ci['limit']), '!' if ci['zone'] == 3 else ''), tc, ci['zone'] == 3))
+        segs.append(('%s%s/%s%s' % ('~' if ci.get('approx') else '', fmt_k(ci['used']), fmt_k(ci['limit']), '!' if ci['zone'] == 3 else ''), tc, ci['zone'] == 3))
         return segs
 
     def lines(self, a):
@@ -720,11 +844,12 @@ class Dock(QWidget):
             if not ci:
                 continue
             if ci['state'] == 'beep':
+                al = self._alarm.setdefault(a.key, {'n': 0, 'ack': False, 'last': 0.0})
                 if a.al_ts != ci['ts']:
-                    a.al_ts = ci['ts']; a.al_beep = 0.0
+                    a.al_ts = ci['ts']; al.update(n=0, ack=False, last=0.0)   # новая серия сигналов для нового кэша
                     self.notify(a.title, 'Кэш скоро остынет — сделайте любой ход в чате.')
-                if now - a.al_beep >= 60:
-                    a.al_beep = now; self.beep()
+                if not al['ack'] and al['n'] < 10 and now - al['last'] >= 5:   # до 10 серий писка каждые 5 с, пока не кликнут по виджету
+                    al['last'] = now; al['n'] += 1; self.beep()
             if ci['zone'] == 3 and a.al_zone != 3:
                 self.notify(a.title, 'Чат заполнен: %s из %s. Переходите в новый чат.' % (fmt_k(ci['used']), fmt_k(ci['limit']))); self.beep(1)
             a.al_zone = ci['zone']
@@ -735,7 +860,7 @@ class Dock(QWidget):
 
     def relayout(self):
         f, k, fm, lh, ic, pad, gap, dot = self.metrics()
-        self.rows = []; y = pad; w = 0
+        self.rows = []; y = pad; w = 0; tmax = 0
         act = [self.st[x] for x in self.ORDER if self.st[x].running]
         norm = lambda t: re.sub(r'\d', '8', t)
         for i, a in enumerate(act):
@@ -750,11 +875,17 @@ class Dock(QWidget):
                 else:
                     tw = sum(fm.horizontalAdvance(norm(t)) for t, _, _ in segs)
                 txtw = max(txtw, tw)
-            self.rows.append((a, y, h)); w = max(w, pad + ic + gap + dot + int(4 * k) + txtw + pad + 2)
+            self.rows.append((a, y, h)); w = max(w, pad + ic + gap + dot + int(4 * k) + txtw + pad + 2); tmax = max(tmax, txtw)
             y += h
+        self._barw = int(36 * k) if self.cfg.get('bars', True) else 0   # тонкие линии-индикаторы справа от цифр
+        self._barx = pad + ic + gap + dot + int(4 * k) + tmax + int(14 * k)   # запас: курсив/жирный шрифт шире расчёта
+        if act and self._barw:
+            w = max(w, self._barx + self._barw + pad)
         if not act:
             w, y = fm.horizontalAdvance('ИИ не запущен') + 4 * pad, lh + pad
         self.setFixedSize(int(w), int(y + pad)); self.update()
+        for d in list(self._det.values()):   # открытые подробности обновляются вместе с данными
+            d.build()
         if self._ready:   # окно видно, только пока запущен хоть один ИИ; без ИИ живёт в трее и появится само
             want = bool(act) and not self._user_hidden
             if want and not self.isVisible():
@@ -797,17 +928,30 @@ class Dock(QWidget):
                     else:
                         p.setPen(c); p.drawText(int(tx), int(base), txt)
                     tx += fm.horizontalAdvance(txt)
+                bp = a.s_pct if j == 0 else a.w_pct if j == 1 else (min(100.0, 100.0 * _['used'] / _['limit']) if _ else None)
+                if self._barw and bp is not None:   # тонкая линия: длина = процент, цвет = зона
+                    by = ly + lh / 2.0; bw = self._barw; fl = bw * max(0.0, min(100.0, bp)) / 100.0
+                    th = max(2.0, 2.0 * k)
+                    if bg == 'none':
+                        p.setPen(QPen(QColor(0, 0, 0, 200), th + 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(self._barx, by), QPointF(self._barx + bw, by))
+                    p.setPen(QPen(QColor(255, 255, 255, 45), th, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(self._barx, by), QPointF(self._barx + bw, by))
+                    if fl >= 1:
+                        p.setPen(QPen(QColor(dcol), th, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)); p.drawLine(QPointF(self._barx, by), QPointF(self._barx + fl, by))
 
     def mousePressEvent(self, e):
+        for al in self._alarm.values():   # клик по виджету гасит писк «ХОД!»
+            al['ack'] = True
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft(); self._moved = False
 
     def mouseMoveEvent(self, e):
-        if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
+        if self._drag is not None and not self.cfg.get('locked', False) and e.buttons() & Qt.MouseButton.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag); self._moved = True
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            if self._dbl:   # второй «отпуск» после двойного клика — не открывать заново
+                self._dbl = False; self._drag = None; return
             if self._moved:
                 self.cfg['x'], self.cfg['y'] = self.x(), self.y(); save_cfg(self.cfg)
             else:
@@ -819,8 +963,22 @@ class Dock(QWidget):
         elif e.button() == Qt.MouseButton.RightButton:
             self.menu().exec(e.globalPosition().toPoint())
 
+    def mouseDoubleClickEvent(self, e):   # двойной клик по виджету — закрыть подробности
+        self._dbl = True; self.close_details()
+
+    def close_details(self):
+        for d in list(self._det.values()):
+            d.close()
+        self._det.clear()
+
     def open_details(self, a):
-        d = Details(self, a); d.adjustSize()
+        same = a.key in self._det
+        self.close_details()
+        if same:   # повторный клик по той же строке — свернуть
+            return
+        d = Details(self, a); d.adjustSize(); self._det[a.key] = d
+        if not self.cfg.get('details_pin', True):
+            QTimer.singleShot(8000, d.close)
         g = QApplication.primaryScreen().availableGeometry()
         x = min(self.x(), g.right() - d.width()); y = self.y() - d.height() - 6
         if y < g.top():
@@ -831,7 +989,34 @@ class Dock(QWidget):
         m = QMenu(self)
         m.addAction('Настройки…', lambda: Settings(self).exec())
         m.addAction('Обновить данные и токены чата', self.engine.refresh)
+        p = m.addAction('Подробности: держать открытыми'); p.setCheckable(True); p.setChecked(self.cfg.get('details_pin', True))
+        p.toggled.connect(lambda on: (self.cfg.__setitem__('details_pin', bool(on)), save_cfg(self.cfg)))
+        m.addAction('Закрыть подробности', self.close_details)
+        bz = m.addAction('Линии-индикаторы справа'); bz.setCheckable(True); bz.setChecked(self.cfg.get('bars', True))
+        bz.toggled.connect(lambda on: (self.cfg.__setitem__('bars', bool(on)), save_cfg(self.cfg), self.relayout()))
         m.addSeparator()
+        wk = self.engine.workers.get('claude'); sess = getattr(self.engine, 'sessions', [])
+        if wk and sess:   # какой аккаунт Claude показывать (как в старом виджете)
+            sm = m.addMenu('Выбрать аккаунт Claude')
+            sel = getattr(wk, 'selected_session_key', None)
+            sm.addAction(('● ' if not sel else '') + 'Авто — как в Claude Desktop', lambda checked=False: wk.select_session(None))
+            sm.addSeparator()
+            for s in sess:
+                sm.addAction(('● ' if s.get('session_key') == sel else '') + '%s (%s)' % (s.get('email') or 'Неизвестный', s.get('source_name') or 'Куки'),
+                             lambda checked=False, k=s.get('session_key'): wk.select_session(k))
+        am = m.addMenu('Аккаунты: подключить / переключить')
+        try:
+            cm = self.engine.mods.get('claude')
+            profs = cm.load_cdp_profiles() if cm else []
+        except Exception:
+            profs = []
+        for i, pr in enumerate(profs, 1):
+            am.addAction('Claude: аккаунт %d — открыть вход в браузере' % i, lambda checked=False, p=pr: self.acc_claude_open(p))
+        am.addAction('Claude: добавить ещё один аккаунт', self.acc_claude_add)
+        am.addSeparator()
+        am.addAction('Codex и Antigravity: как сменить аккаунт', self.acc_help)
+        lk = m.addAction('Закрепить положение'); lk.setCheckable(True); lk.setChecked(self.cfg.get('locked', False))
+        lk.toggled.connect(lambda on: (self.cfg.__setitem__('locked', bool(on)), save_cfg(self.cfg)))
         a = m.addAction('Запускать с Windows'); a.setCheckable(True); a.setChecked(self.autostart_on()); a.toggled.connect(self.set_autostart)
         m.addAction('Проверить обновление', lambda: self.check_update(True))
         m.addAction('Инструкция (ReadMe)', self.show_readme)
@@ -841,6 +1026,41 @@ class Dock(QWidget):
         m.addAction('Свернуть (вернётся сам при запуске ИИ)', self.minimize_to_tray)
         m.addAction('Закрыть полностью', self.quit_full)
         return m
+
+    def acc_claude_open(self, pr):
+        """Открыть видимое окно браузера виджета, чтобы войти в нужный аккаунт claude.ai."""
+        try:
+            self.engine.mods['claude'].launch_cdp_chrome(pr['port'], pr['profile'], visible=True)
+            self.notify('AIWidgetDock', 'Войдите в claude.ai в открывшемся окне. Потом закройте его: виджет подхватит аккаунт сам.')
+        except Exception as ex:
+            log('acc open: %r' % ex); self.notify('AIWidgetDock', 'Не удалось открыть браузер: %s' % ex)
+
+    def acc_claude_add(self):
+        """Добавить ещё один браузер виджета (отдельный профиль) для второго аккаунта Claude."""
+        try:
+            cm = self.engine.mods['claude']
+            lst = cm.load_cdp_profiles()
+            port = max([x['port'] for x in lst] + [9230]) + 1
+            while port in (9223, 9224, 9225, 9226):   # эти порты занимают чужие браузеры
+                port += 1
+            prof = 'ClaudeWidget%d' % (len(lst) + 1)
+            while any(x['profile'] == prof for x in lst):
+                prof += 'x'
+            lst.append({'port': port, 'profile': prof}); cm.save_cdp_profiles(lst)
+            cm.launch_cdp_chrome(port, prof, visible=True)
+            self.notify('AIWidgetDock', 'Новый аккаунт: войдите в claude.ai в открывшемся окне, потом закройте его.')
+            QTimer.singleShot(20000, self.engine.refresh)
+        except Exception as ex:
+            log('acc add: %r' % ex); self.notify('AIWidgetDock', 'Не удалось добавить аккаунт: %s' % ex)
+
+    def acc_help(self):
+        QMessageBox.information(self, APP,
+            'Виджет читает тот аккаунт, в который вошла сама программа.\n\n'
+            'Codex: выйдите в приложении Codex и войдите другим аккаунтом, затем сделайте один запрос. '
+            'Виджет подхватит новые лимиты сам.\n\n'
+            'Antigravity: войдите в нужный аккаунт Google в самой программе. '
+            'Если данных нет, закройте и откройте Antigravity.\n\n'
+            'Claude: пункты выше в этом меню открывают отдельное окно браузера для входа в claude.ai.')
 
     def hide_bridges(self):
         try:
