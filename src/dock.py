@@ -6,7 +6,7 @@ import sys, os, re, json, time, glob, csv, threading, subprocess, importlib.util
 from datetime import datetime
 
 APP = 'AIWidgetDock'
-VERSION = '1.3.3'
+VERSION = '1.3.4'
 REPO = 'ivankoval921-bit/AIWidgetDock'
 DATA = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP)
 os.makedirs(os.path.join(DATA, 'engine'), exist_ok=True)
@@ -191,6 +191,73 @@ def window_running(names, out):
         return True   # при сбое проверки не прячем строку
 
 
+def window_state(names, out):
+    """Состояние окон программы ИИ: 'open' — есть развёрнутое окно на экране, 'min' — только свёрнутые окна,
+    'tray' — процесс работает без окон (сидит в трее), None — программа не запущена."""
+    import ctypes
+    from ctypes import wintypes
+    try:
+        pids = set()
+        for ln in out.splitlines():
+            p = ln.split('","')
+            if len(p) >= 2 and p[0].strip('"') in names:
+                pids.add(int(p[1].strip('"')))
+        if not pids:
+            return None
+        u = ctypes.windll.user32
+        res = {'open': False, 'min': False}
+        WNDENUM = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def cb(hwnd, _):
+            try:
+                if u.IsWindowVisible(hwnd) and not u.GetWindow(hwnd, 4):   # видимое окно верхнего уровня без владельца
+                    pid = wintypes.DWORD(); u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value in pids:
+                        if u.IsIconic(hwnd):
+                            res['min'] = True
+                        else:
+                            r = wintypes.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
+                            if r.right - r.left > 200 and r.bottom - r.top > 150 and r.left > -30000:
+                                res['open'] = True; return False
+            except Exception:
+                pass
+            return True
+        u.EnumWindows(WNDENUM(cb), 0)
+        return 'open' if res['open'] else 'min' if res['min'] else 'tray'
+    except Exception:
+        return 'open'   # при сбое проверки строку не прячем
+
+
+def desktop_dir():
+    """Папка рабочего стола пользователя (может быть перенесена, например, на D:)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf)
+        if buf.value and os.path.isdir(buf.value):
+            return buf.value
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser('~'), 'Desktop')
+
+
+def make_shortcut(lnk, target):
+    """Создать или поправить ярлык (только если он ведёт не туда)."""
+    try:
+        q = lambda s: s.replace("'", "''")
+        ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');if($s.TargetPath -ne '%s'){$s.TargetPath='%s';"
+              "$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='AIWidgetDock — лимиты ИИ';$s.Save()}"
+              % (q(lnk), q(target), q(target), q(os.path.dirname(target)), q(target)))
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps], creationflags=0x08000000, timeout=30)
+    except Exception as ex:
+        log('shortcut %s: %r' % (lnk, ex))
+
+
+INSTALL_DIR = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'Programs', 'AIWidgetDock_Widget')   # своя папка: в Programs\AIWidgetDock стоит старый установщик 1.0.0
+INSTALL_EXE = os.path.join(INSTALL_DIR, APP + '.exe')
+
+
 def update_bat_text(new, exe, flag, target, name, prev, failed, heartbeat):
     """Текст bat для безопасной замены exe: если новая версия не запустилась, возвращается прежняя."""
     if heartbeat:   # версии с 1.3.0 сами отмечают успешный запуск файлом started.flag
@@ -316,6 +383,9 @@ class AIState:
 
 class Bus(QObject):
     changed = pyqtSignal()
+    procs = pyqtSignal(object)   # результат проверки программ ИИ из фонового потока
+    show_req = pyqtSignal()      # повторный запуск exe просит показать виджет
+    upd = pyqtSignal(object)     # обновление скачано в фоне и готово к установке
 
 
 def iso_ts(s):
@@ -800,8 +870,10 @@ README = """<h3>AIWidgetDock — виджет лимитов ИИ</h3>
 <b>нижняя</b> — недельный лимит (процент, дата и час сброса).
 Цвет цифр: зелёный 0–25%, жёлтый 25–55%, оранжевый 55–90%, красный от 90%. Тонкие линии, длина которых равна проценту, включаются в конструкторе вида.</p>
 <p>Строка ИИ появляется, когда его программа запущена, и пропадает, когда она закрыта.</p>
-<h4>Установка</h4><ol><li>Скопируйте <b>AIWidgetDock.exe</b> в любую папку (например D:\\Programs) и запустите.</li>
-<li>Чтобы запускался вместе с Windows: правый клик по виджету → «Запускать с Windows».</li></ol>
+<h4>Установка (с 1.3.4)</h4><ol><li>Запустите <b>AIWidgetDock.exe</b> откуда угодно. Он сам перенесёт себя в постоянную папку
+%LOCALAPPDATA%\\Programs\\AIWidgetDock_Widget, создаст ярлык <b>AIWidgetDock</b> на рабочем столе и в меню «Пуск» и включит запуск вместе с Windows.</li>
+<li>Если виджет не видно — нажмите ярлык AIWidgetDock ещё раз или кликните значок в трее (у часов): виджет покажется сразу.</li>
+<li>Обновления приходят сами (проверка при запуске и раз в 2 часа). После обновления у часов появится сообщение «что нового».</li></ol>
 <h4>Строка «чат» (новое в 1.1)</h4>
 <p>Справа от лимитов, за вертикальной перегородкой, показан <b>текущий чат</b>: сверху токены («187k/400k»), снизу обратный отсчёт кэша («кэш 54м»). Старый вид, где чат идёт третьей строкой, включается в конструкторе: набор «Стандарт: чат третьей строкой».
 <b>Кэш</b> — сколько ещё минут ИИ читает ваш чат из дешёвой памяти. Каждый ход обновляет отсчёт. Когда остаётся меньше четверти срока, цифра становится красной и мигает,
@@ -823,7 +895,11 @@ Claude Code и Codex считаются автоматически из журн
 Любое ручное изменение превращает набор в «Свой». «Как было» возвращает «Стандарт» (без линий). Клик по блоку ИИ в любой форме открывает полную версию с подробностями.</p>
 <h4>Откат версии</h4>
 <p>Правый клик → «Откатиться на другую версию…»: выберите любую выпущенную версию, виджет скачает её и перезапустится. Настройки сохраняются. После отката автообновление выключается, чтобы виджет не вернулся на новую версию сам; включить обратно: галочка «Автообновление» в меню.</p>
-<h4>Работа в фоне</h4><p>Виджет живёт в трее и сам запускается вместе с Windows. Он показывается, только пока запущен хоть один ИИ, и пропадает, когда все закрыты; при следующем запуске ИИ появляется снова. «Свернуть» прячет его до запуска ИИ, «Закрыть полностью» выключает совсем (запуск: меню «Пуск» → AIWidgetDock). Служебные окна браузера для чтения лимитов Claude скрыты и не мешают.</p>
+<h4>Работа в фоне</h4><p>Виджет живёт в трее и сам запускается вместе с Windows. Блок на столе виден, пока открыто окно хотя бы одного ИИ (Claude, Codex, Antigravity, Grok).
+Свернули или закрыли в трей все окна ИИ — виджет уходит в трей (значок у часов) и сразу появляется, когда окно ИИ снова открыто. Строки ИИ, работающих в фоне, остаются в блоке.
+Галочка «Прятать в трей, когда окна ИИ свёрнуты» в меню: если её снять, виджет виден и при свёрнутых окнах.
+«Свернуть в трей» прячет его до следующего открытия окна ИИ, Alt+F4 тоже только прячет в трей. «Закрыть полностью» выключает совсем (запуск: ярлык AIWidgetDock).
+Если виджет уехал за край экрана (сменился монитор), он сам возвращается на основной экран. «Обновить данные» перезапускает чтение, если цифры не подтянулись. Служебные окна браузера для чтения лимитов Claude скрыты и не мешают.</p>
 <h4>Управление</h4><ul><li>Перетащить — левой кнопкой за блок. Клик по строке — подробности: сессия, неделя, окно контекста (где программа его отдаёт).</li>
 <li>Клик (или двойной клик) по блоку ИИ открывает подробности; ещё один клик по тому же блоку или двойной клик по самому окну закрывает их. Окно держится открытым и обновляется само, только когда меняются цифры.</li>
 <li>Правый клик — меню: Настройки (шрифт, жирность, курсив, размер, масштаб, фон: чёрный / полупрозрачный / без фона), Обновить, «Конструктор вида…», «Подробности: держать открытыми», «Линии-индикаторы», «Выбрать аккаунт Claude» (авто или конкретный), «Аккаунты: подключить / переключить» (вход в ещё один аккаунт Claude через браузер), «Закрепить положение», Проверить обновление, «Откатиться на другую версию…», «Автообновление», Инструкция, «Свернуть», «Закрыть полностью».</li></ul>
@@ -906,24 +982,34 @@ class Dock(QWidget):
         self.cfg = load_cfg()
         if 'bars' in self.cfg:   # старая настройка 1.2.3 переезжает в конструктор
             u = dict(self.cfg.get('ui', {})); u.setdefault('bars', bool(self.cfg.pop('bars'))); self.cfg['ui'] = u
-        self.bus = Bus(); self.bus.changed.connect(self.relayout)
+        self.bus = Bus(); self.bus.changed.connect(self.relayout); self.bus.procs.connect(self.apply_procs); self.bus.show_req.connect(self.show_now); self.bus.upd.connect(self.finish_auto_update)
         icons = {k: os.path.join(RES, 'assets', 'icon_%s.png' % k) for k in self.ORDER}
         self.st = {k: AIState(k, t, QPixmap(icons[k]) if os.path.exists(icons[k]) else QPixmap())
                    for k, t in (('claude', 'Claude'), ('codex', 'Codex'), ('antigravity', 'Antigravity'), ('grok', 'Grok'))}
         self.engine = Engine(self.st, self.bus)
         self.rows = []; self.cells = []; self._seps = []; self._force_show = False; self._det = {}; self._alarm = {}; self._dbl = False; self._drag = None; self._moved = False; self._procs = {}; self._user_hidden = False; self._ready = False
-        self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(5000)
-        self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.engine.read_all); self.t_codex.start(20000)
+        self._win = {}; self._proc_busy = False; self._read_busy = False; self._last_proc_ok = time.time()
+        self.t_proc = QTimer(self); self.t_proc.timeout.connect(self.check_procs); self.t_proc.start(3000)
+        self.t_codex = QTimer(self); self.t_codex.timeout.connect(self.read_bg); self.t_codex.start(20000)
+        self.t_guard = QTimer(self); self.t_guard.timeout.connect(self.guard); self.t_guard.start(15000)   # страж: окно на экране, поверх, данные не зависли
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.relayout); self.t_tick.start(30000)
         self.t_blink = QTimer(self); self.t_blink.timeout.connect(self.tick); self.t_blink.start(1000)
         self.t_hide = QTimer(self); self.t_hide.timeout.connect(self.hide_bridges); self.t_hide.start(3000)
         self.t_stat = QTimer(self); self.t_stat.timeout.connect(lambda: [stat(a, 'hourly') for a in self.st.values() if a.running]); self.t_stat.start(3600000)
-        self.tray = QSystemTrayIcon(QIcon(icons['claude']), self); self.tray.setToolTip('AIWidgetDock'); self.tray.setContextMenu(self.menu()); self.tray.show(); self.tray.activated.connect(self.on_tray)
+        self.tray = QSystemTrayIcon(QIcon(icons['claude']), self); self.tray.setToolTip('AIWidgetDock %s' % VERSION)
+        self._tm = QMenu(); self._tm_src = None; self._tm.aboutToShow.connect(self._fill_tray)   # меню трея собирается заново при каждом открытии (свежие аккаунты)
+        self.tray.setContextMenu(self._tm); self.tray.show(); self.tray.activated.connect(self.on_tray)
         self.check_procs(); self.engine.read_all(); self.relayout()
         if self.cfg['x'] >= 0:
             self.move(self.cfg['x'], self.cfg['y'])
         else:
             g = QApplication.primaryScreen().availableGeometry(); self.move(g.right() - self.width() - 20, g.bottom() - self.height() - 70)
+        self.ensure_on_screen()
+        try:
+            QApplication.instance().screenRemoved.connect(lambda *_: QTimer.singleShot(1500, self.ensure_on_screen))
+            QApplication.instance().screenAdded.connect(lambda *_: QTimer.singleShot(1500, self.ensure_on_screen))
+        except Exception:
+            pass
         if self.cfg.get('first_run'):
             self.cfg['first_run'] = False; save_cfg(self.cfg); QTimer.singleShot(800, self.show_readme)
         QTimer.singleShot(15000, lambda: self.check_update(False))
@@ -931,37 +1017,154 @@ class Dock(QWidget):
             self.cfg['autostart_init'] = True; save_cfg(self.cfg); self.set_autostart(True)
         if not self.cfg.get('lnk_made'):
             self.cfg['lnk_made'] = True; save_cfg(self.cfg); threading.Thread(target=make_start_shortcut, daemon=True).start()
-        self.t_upd = QTimer(self); self.t_upd.timeout.connect(lambda: self.check_update(False)); self.t_upd.start(6 * 3600 * 1000)   # и дальше раз в 6 часов
+        self.t_upd = QTimer(self); self.t_upd.timeout.connect(lambda: self.check_update(False)); self.t_upd.start(2 * 3600 * 1000)   # и дальше раз в 2 часа
 
-    def check_procs(self):
-        """Строка ИИ видна, только пока его программа работает."""
+    def _fill_tray(self):
+        try:
+            self._tm.clear(); self._tm_src = self.menu()
+            for a in self._tm_src.actions():
+                self._tm.addAction(a)
+        except Exception as ex:
+            log('tray menu: %r' % ex)
+
+    def show_now(self):
+        """Показать виджет сейчас (из трея, ярлыка или повторного запуска exe), даже без запущенных ИИ."""
+        self._user_hidden = False; self._force_show = True
+        self.relayout(); self.ensure_on_screen()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def ensure_on_screen(self):
+        """Если виджет оказался за пределами экранов (сменился монитор, разрешение, док-станция) — вернуть на основной экран."""
+        try:
+            fr = self.frameGeometry()
+            for s in QApplication.screens():
+                g = s.availableGeometry()
+                if g.intersects(fr) and g.intersected(fr).width() >= min(40, fr.width()) and g.intersected(fr).height() >= min(20, fr.height()):
+                    return
+            g = QApplication.primaryScreen().availableGeometry()
+            self.move(g.right() - self.width() - 20, g.top() + 80)
+            self.cfg['x'], self.cfg['y'] = self.x(), self.y(); save_cfg(self.cfg)
+            log('moved back on screen: %d,%d' % (self.x(), self.y()))
+        except Exception as ex:
+            log('on screen: %r' % ex)
+
+    def guard(self):
+        """Страж раз в 15 с: виджет на экране и поверх окон; если проверка процессов зависла — сбросить её."""
+        try:
+            if self._proc_busy and time.time() - self._last_proc_ok > 60:
+                log('guard: process check stuck, reset'); self._proc_busy = False
+            if self._read_busy and time.time() - getattr(self, '_read_start', 0) > 120:
+                log('guard: data read stuck, reset'); self._read_busy = False
+            if self.isVisible():
+                self.ensure_on_screen()
+                if not self._drag:
+                    self.raise_()
+        except Exception as ex:
+            log('guard: %r' % ex)
+
+    def read_bg(self):
+        """Чтение журналов Codex / Claude Code в фоне: окно виджета не подвисает на больших файлах."""
+        if self._read_busy:
+            return
+        self._read_busy = True; self._read_start = time.time()
+
         def run():
             try:
-                out = subprocess.check_output(['tasklist', '/FO', 'CSV', '/NH'], creationflags=0x08000000).decode('utf-8', 'ignore').lower()
-            except Exception:
-                out = ''
-            r = {'claude': proc_running(['claude.exe'], out), 'codex': proc_running(['codex.exe', 'chatgpt.exe', 'openai.codex.exe'], out),
-                 'antigravity': window_running(['antigravity.exe'], out), 'grok': proc_running(['grok.exe'], out)}
-            if not r['grok']:
-                d = os.path.join(os.path.expanduser('~'), '.grok', 'sessions')
-                if os.path.isdir(d):
-                    fs = glob.glob(os.path.join(d, '**', '*'), recursive=True)
-                    r['grok'] = bool(fs) and time.time() - max(os.path.getmtime(x) for x in fs) < 1800
-            self._procs = r
-        t = threading.Thread(target=run, daemon=True); t.start(); t.join(4)
-        ch = False
+                self.engine.read_all()
+            except Exception as ex:
+                log('read: %r' % ex)
+            finally:
+                self._read_busy = False
+        threading.Thread(target=run, daemon=True).start()
+
+    def refresh_all(self):
+        """Кнопка «Обновить»: перезапуск чтения всех ИИ и браузеров виджета, данные подтягиваются заново."""
+        try:
+            for k in list(self.engine.workers):
+                w = self.engine.workers.get(k)
+                if w is not None and hasattr(w, 'isRunning') and not w.isRunning():   # поток движка умер — запускаем заново
+                    self.engine.workers.pop(k, None); log('worker %s dead, restart' % k)
+                    if self.st[k].running:
+                        self.engine.start(k)
+            self.engine._web_ts = 0; self.engine._web_busy = False
+            for w in self.engine.workers.values():
+                try:
+                    w.force_refresh = True
+                except Exception:
+                    pass
+            self._read_busy = False; self.read_bg(); self.check_procs()
+            self.notify('AIWidgetDock', 'Данные обновляются: цифры подтянутся за 10–30 секунд.')
+        except Exception as ex:
+            log('refresh: %r' % ex)
+
+    def check_procs(self):
+        """Проверка программ ИИ в фоновом потоке (окно виджета не подвисает). Результат приходит в apply_procs."""
+        if self._proc_busy:
+            return
+        self._proc_busy = True
+
+        def run():
+            r = {}
+            try:
+                try:
+                    out = subprocess.check_output(['tasklist', '/FO', 'CSV', '/NH'], creationflags=0x08000000, timeout=20).decode('utf-8', 'ignore').lower()
+                except Exception:
+                    out = ''
+                if not out:
+                    return   # tasklist не ответил: оставляем прежнее состояние, ничего не прячем
+                r = {'claude': window_state(['claude.exe'], out), 'codex': window_state(['codex.exe', 'chatgpt.exe', 'openai.codex.exe'], out),
+                     'antigravity': window_state(['antigravity.exe'], out), 'grok': 'open' if proc_running(['grok.exe'], out) else None}
+                if not r['grok']:
+                    d = os.path.join(os.path.expanduser('~'), '.grok', 'sessions')
+                    if os.path.isdir(d):
+                        fs = glob.glob(os.path.join(d, '**', '*'), recursive=True)
+                        if fs and time.time() - max(os.path.getmtime(x) for x in fs) < 1800:
+                            r['grok'] = 'open'
+                self.bus.procs.emit(r)
+            except Exception as ex:
+                log('procs: %r' % ex)
+            finally:
+                self._proc_busy = False; self._last_proc_ok = time.time()
+        threading.Thread(target=run, daemon=True).start()
+
+    def apply_procs(self, r):
+        """Строка ИИ есть, пока его программа работает (в том числе в трее). Сам блок виден, пока открыто окно хотя бы одного ИИ:
+        все окна ИИ свёрнуты или закрыты в трей — виджет уходит в трей и появится сам, когда окно ИИ откроется снова."""
+        try:
+            prev = dict(self._win); self._win = dict(r); self._procs = {k: bool(v) for k, v in r.items()}
+            ch = False
+            for k, a in self.st.items():
+                stt = r.get(k)
+                if k == 'antigravity' and stt == 'tray':
+                    stt = None   # фоновые процессы Antigravity без окон остаются после закрытия программы
+                on = bool(stt) and self.cfg['show'].get(k, True)
+                if on != a.running:
+                    a.running = on; ch = True; stat(a, 'start' if on else 'stop')
+                    if on:
+                        self.engine.start(k)
+                    else:
+                        self.engine.stop(k)
+                if on and stt == 'open' and prev.get(k) != 'open':   # окно ИИ открыли — виджет показывается снова
+                    self._user_hidden = False; self._force_show = False; ch = True
+            if ch or self._active_ai() != getattr(self, '_was_active', None):
+                self._was_active = self._active_ai(); self.relayout()
+        except Exception as ex:
+            log('apply procs: %r' % ex)
+
+    def _active_ai(self):
+        """Есть ли сейчас открытое (не свёрнутое) окно ИИ. Codex в терминале окон не имеет — считаем по свежему журналу."""
+        hide_min = self.cfg.get('hide_min', True)
         for k, a in self.st.items():
-            on = bool(self._procs.get(k)) and self.cfg['show'].get(k, True)
-            if on != a.running:
-                a.running = on; ch = True; stat(a, 'start' if on else 'stop')
-                if on:
-                    self._user_hidden = False
-                if on:
-                    self.engine.start(k)
-                else:
-                    self.engine.stop(k)
-        if ch:
-            self.relayout()
+            if not a.running:
+                continue
+            s = self._win.get(k)
+            if s == 'open' or (s == 'min' and not hide_min):
+                return True
+            if k == 'codex' and s == 'tray' and time.time() - max(a.ch_ts or 0, a.ctx_ts or 0, a.updated or 0) < 600:
+                return True
+        return False
 
     def fonts(self):
         k = self.cfg['scale'] / 100.0
@@ -1209,11 +1412,13 @@ class Dock(QWidget):
         for d in list(self._det.values()):   # открытые подробности обновляются вместе с данными (только если что-то изменилось)
             safe_call(d.build)
         if self._ready:   # окно видно, только пока запущен хоть один ИИ; без ИИ живёт в трее и появится само
-            want = (bool(act) or self._force_show) and not self._user_hidden
+            want = ((bool(act) and self._active_ai()) or self._force_show) and not self._user_hidden
             if want and not self.isVisible():
-                self.show()
+                self.show(); self.ensure_on_screen(); self.raise_()
             elif not want and self.isVisible():
                 self.hide()
+            if want != getattr(self, '_last_want', None):
+                self._last_want = want; log('widget %s (ai: %s)' % ('shown' if want else 'to tray', ','.join(k for k, v in self._win.items() if v) or '-'))
 
     def draw_bar(self, p, bx, by, wd, pct, col, thk, th, bg):
         fl = wd * max(0.0, min(100.0, pct)) / 100.0
@@ -1342,8 +1547,12 @@ class Dock(QWidget):
 
     def menu(self):
         m = QMenu(self)
+        m.addAction('Показать виджет', self.show_now)
+        m.addAction('Обновить данные (если цифры не подтянулись)', self.refresh_all)
+        m.addSeparator()
         m.addAction('Настройки…', lambda: Settings(self).exec())
-        m.addAction('Обновить данные и токены чата', self.engine.refresh)
+        hm = m.addAction('Прятать в трей, когда окна ИИ свёрнуты'); hm.setCheckable(True); hm.setChecked(self.cfg.get('hide_min', True))
+        hm.toggled.connect(lambda on: (self.cfg.__setitem__('hide_min', bool(on)), save_cfg(self.cfg), self.relayout()))
         p = m.addAction('Подробности: держать открытыми'); p.setCheckable(True); p.setChecked(self.cfg.get('details_pin', True))
         p.toggled.connect(lambda on: (self.cfg.__setitem__('details_pin', bool(on)), save_cfg(self.cfg)))
         m.addAction('Закрыть подробности', self.close_details)
@@ -1382,7 +1591,7 @@ class Dock(QWidget):
         m.addAction('Папка настроек и статистики', lambda: os.startfile(DATA))
         m.addSeparator()
         m.addAction('Версия ' + VERSION).setEnabled(False)
-        m.addAction('Свернуть (вернётся сам при запуске ИИ)', self.minimize_to_tray)
+        m.addAction('Свернуть в трей (вернётся сам, когда откроете окно ИИ)', self.minimize_to_tray)
         m.addAction('Закрыть полностью', self.quit_full)
         return m
 
@@ -1430,16 +1639,22 @@ class Dock(QWidget):
             log('hide bridges: %r' % ex)
 
     def minimize_to_tray(self):
-        self._user_hidden = True; self._force_show = False; self.hide()
-        self.notify('AIWidgetDock', 'Виджет свёрнут в трей. Появится сам, когда запустится ИИ, или по клику на значок в трее.')
+        self._user_hidden = True; self._force_show = False; self.hide(); log('user: minimize to tray')
+        self.notify('AIWidgetDock', 'Виджет в трее (значок у часов). Появится сам, когда откроете окно ИИ, или по клику на значок.')
 
     def on_tray(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._user_hidden = False; self._force_show = True; self.relayout()   # показать даже без запущенных ИИ
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_now()   # показать даже без запущенных ИИ
+
+    def closeEvent(self, e):
+        """Alt+F4 и подобное не закрывают виджет: он уходит в трей."""
+        if getattr(self, '_quitting', False):
+            e.accept(); return
+        e.ignore(); self.minimize_to_tray()
 
     def quit_full(self):
-        if QMessageBox.question(self, APP, 'Закрыть виджет полностью?\nОн снова запустится при входе в Windows или из меню «Пуск».') == QMessageBox.StandardButton.Yes:
-            QApplication.quit()
+        if QMessageBox.question(self, APP, 'Закрыть виджет полностью?\nОн снова запустится при входе в Windows, ярлыком на рабочем столе или из меню «Пуск».') == QMessageBox.StandardButton.Yes:
+            self._quitting = True; log('user: quit'); QApplication.quit()
 
     def show_readme(self):
         d = QDialog(self); d.setWindowTitle('AIWidgetDock — инструкция'); d.resize(560, 560)
@@ -1464,6 +1679,8 @@ class Dock(QWidget):
                     winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, '"%s"' % sys.executable)
                 else:
                     winreg.DeleteValue(k, APP)
+            if self.cfg.get('autostart_off') != (not on):   # выключил сам пользователь — сторож автозапуск не возвращает
+                self.cfg['autostart_off'] = not on; save_cfg(self.cfg)
         except Exception as e:
             log('autostart: %r' % e)
 
@@ -1481,13 +1698,27 @@ class Dock(QWidget):
                 pass
             if cur is not None and cur != '"%s"' % sys.executable:
                 self.set_autostart(True); log('autostart path fixed: %s -> %s' % (cur, sys.executable))
-            lnk = os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'AIWidgetDock.lnk')
-            if os.path.exists(lnk):
-                ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');if($s.TargetPath -ne '%s'){$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.Save()}"
-                      % (lnk, sys.executable, sys.executable, os.path.dirname(sys.executable)))
-                subprocess.run(['powershell', '-NoProfile', '-Command', ps], creationflags=0x08000000, timeout=30)
+            elif cur is None and not self.cfg.get('autostart_off'):
+                self.set_autostart(True); log('autostart restored')
+            # ярлыки «AIWidgetDock» в меню «Пуск» и на рабочем столе всегда ведут на запущенный exe (создаются, если их нет)
+            make_shortcut(os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'AIWidgetDock.lnk'), sys.executable)
+            make_shortcut(os.path.join(desktop_dir(), 'AIWidgetDock.lnk'), sys.executable)
         except Exception as ex:
             log('self heal: %r' % ex)
+
+    def show_whatsnew(self):
+        """После обновления — уведомление у часов: версия и что нового."""
+        f = os.path.join(DATA, 'whatsnew.json')
+        try:
+            if not os.path.exists(f):
+                return
+            w = json.load(open(f, encoding='utf-8')); os.remove(f)
+            if w.get('tag') == VERSION:
+                notes = re.sub(r'[#*`]', '', w.get('notes') or '').strip()
+                self.tray.showMessage('AIWidgetDock обновлён до %s' % VERSION, notes[:240] or 'Улучшена работа виджета.', QSystemTrayIcon.MessageIcon.Information, 12000)
+                log('updated to %s' % VERSION)
+        except Exception as ex:
+            log('whatsnew: %r' % ex)
 
     def check_failed_update(self):
         """Если прошлая установка не запустилась и bat вернул прежнюю версию, сообщить об этом."""
@@ -1511,10 +1742,29 @@ class Dock(QWidget):
                                 'Открыть список версий, чтобы выбрать другую?' % (tag, VERSION, rec)) == QMessageBox.StandardButton.Yes:
             self.rollback()
 
-    def _install_exe(self, url, tag=''):
+    def _save_whatsnew(self, tag, notes):
+        try:
+            with open(os.path.join(DATA, 'whatsnew.json'), 'w', encoding='utf-8') as f:
+                json.dump({'tag': tag, 'notes': notes}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def finish_auto_update(self, d):
+        """Скачанное в фоне обновление ставится, когда пользователь не работает с окнами виджета."""
+        if self._drag or any(isinstance(w, QDialog) and w.isVisible() for w in QApplication.topLevelWidgets()):
+            QTimer.singleShot(60000, lambda: self.finish_auto_update(d)); return
+        try:
+            self._save_whatsnew(d['tag'], d['notes']); log('auto update %s -> %s' % (VERSION, d['tag']))
+            self.tray.showMessage('AIWidgetDock', 'Устанавливается обновление %s. Виджет перезапустится сам.' % d['tag'], QSystemTrayIcon.MessageIcon.Information, 5000)
+            QTimer.singleShot(1500, lambda: self._install_exe(None, d['tag'], d['new']))
+        except Exception as ex:
+            log('auto update install: %r' % ex)
+
+    def _install_exe(self, url, tag='', new=None):
         """Скачать exe и заменить запущенный файл безопасно: прежняя версия сохраняется в AppData\\AIWidgetDock\\prev."""
-        new = os.path.join(tempfile.gettempdir(), 'AIWidgetDock_new.exe')
-        urllib.request.urlretrieve(url, new)
+        if new is None:
+            new = os.path.join(tempfile.gettempdir(), 'AIWidgetDock_new.exe')
+            urllib.request.urlretrieve(url, new)
         exe = sys.executable
         prevdir = os.path.join(DATA, 'prev'); os.makedirs(prevdir, exist_ok=True)
         prev = os.path.join(prevdir, 'AIWidgetDock_prev.exe')
@@ -1571,8 +1821,34 @@ class Dock(QWidget):
             log('rollback: %r' % e); QMessageBox.warning(self, APP, 'Не удалось установить версию: %s' % e)
 
     def check_update(self, manual):
-        """Обновление с GitHub Releases: новая версия с номером и «что нового»."""
-        if not manual and self.cfg.get('no_auto_update'):
+        """Обновление с GitHub Releases: новая версия с номером и «что нового».
+        Автопроверка (раз в 2 часа) идёт в фоне: скачивает exe и ставит сам, без вопросов; ручная — спрашивает."""
+        if not manual:
+            if self.cfg.get('no_auto_update') or getattr(self, '_upd_busy', False) or not getattr(sys, 'frozen', False):
+                return
+            self._upd_busy = True
+
+            def run():
+                try:
+                    req = urllib.request.Request('https://api.github.com/repos/%s/releases/latest' % REPO, headers={'User-Agent': APP})
+                    r = json.load(urllib.request.urlopen(req, timeout=15))
+                    tag = str(r.get('tag_name', '')).lstrip('vV')
+                    ver = lambda s: tuple(int(x) for x in s.split('.') if x.isdigit())
+                    if not tag or ver(tag) <= ver(VERSION):
+                        return
+                    asset = next((x for x in r.get('assets', []) if x.get('name', '').lower().endswith('.exe')), None)
+                    if not asset:
+                        return
+                    new = os.path.join(tempfile.gettempdir(), 'AIWidgetDock_new.exe')
+                    urllib.request.urlretrieve(asset['browser_download_url'], new)
+                    if os.path.getsize(new) < 5_000_000 or (asset.get('size') and os.path.getsize(new) != asset['size']):
+                        log('auto update: bad download %d' % os.path.getsize(new)); return
+                    self.bus.upd.emit({'tag': tag, 'notes': (r.get('body') or '').strip(), 'new': new})
+                except Exception as ex:
+                    log('auto update: %r' % ex)
+                finally:
+                    self._upd_busy = False
+            threading.Thread(target=run, daemon=True).start()
             return
         try:
             req = urllib.request.Request('https://api.github.com/repos/%s/releases/latest' % REPO, headers={'User-Agent': APP})
@@ -1586,14 +1862,18 @@ class Dock(QWidget):
                     QMessageBox.information(self, APP, 'У вас последняя версия %s.' % VERSION)
                 return
             notes = (r.get('body') or '').strip() or '—'
-            msg = ('Доступна новая версия %s (у вас %s).\n\nЧто нового:\n%s\n• улучшена производительность\n• улучшена обработка данных\n\nОбновить сейчас?' % (tag, VERSION, notes))
-            if QMessageBox.question(self, APP, msg) != QMessageBox.StandardButton.Yes:
-                self._declined = tag
-                return
             asset = next((x for x in r.get('assets', []) if x.get('name', '').lower().endswith('.exe')), None)
+            if manual:
+                msg = ('Доступна новая версия %s (у вас %s).\n\nЧто нового:\n%s\n\nОбновить сейчас?' % (tag, VERSION, notes))
+                if QMessageBox.question(self, APP, msg) != QMessageBox.StandardButton.Yes:
+                    self._declined = tag
+                    return
             if not asset or not getattr(sys, 'frozen', False):
-                QMessageBox.information(self, APP, 'Скачайте новую версию со страницы:\n' + r.get('html_url', '')); return
+                if manual:
+                    QMessageBox.information(self, APP, 'Скачайте новую версию со страницы:\n' + r.get('html_url', ''))
+                return
             self.cfg['no_auto_update'] = False; save_cfg(self.cfg)
+            self._save_whatsnew(tag, notes); log('update %s -> %s' % (VERSION, tag))
             self._install_exe(asset['browser_download_url'], tag)
         except Exception as e:
             log('update: %r' % e)
@@ -1639,14 +1919,136 @@ def install_crash_guards():
         pass
 
 
+IPC_NAME = 'AIWidgetDock_ipc_' + re.sub(r'\W', '_', os.environ.get('USERNAME', 'u'))
+
+
+def _ask_running_to_show(cmd=b'show'):
+    """Если виджет уже работает — попросить его показаться (вместо молчаливого выхода, как было до 1.3.4).
+    cmd=b'quit' — попросить закрыться: запускают другой (новый) exe, он займёт место старого."""
+    from PyQt6.QtNetwork import QLocalSocket
+    s = QLocalSocket(); s.connectToServer(IPC_NAME)
+    if s.waitForConnected(1500):
+        s.write(cmd); s.flush(); s.waitForBytesWritten(1000); s.disconnectFromServer()
+        return True
+    return False
+
+
+def _is_new_build():
+    """Запущен exe не из постоянной папки и он отличается от установленного (другая версия)."""
+    if not getattr(sys, 'frozen', False) or '--here' in sys.argv:
+        return False
+    if os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(INSTALL_EXE):
+        return False
+    try:
+        if not os.path.exists(INSTALL_EXE) or os.path.getsize(INSTALL_EXE) != os.path.getsize(sys.executable):
+            return True
+        import hashlib
+        hs = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+        return hs(INSTALL_EXE) != hs(sys.executable)
+    except Exception:
+        return True
+
+
+def _kill_old_instances():
+    """Старые версии (до 1.3.4) не умеют показываться по просьбе. Если такая висит невидимой — закрыть её."""
+    import ctypes
+    from ctypes import wintypes
+    me = os.getpid()
+    try:
+        out = subprocess.check_output(['tasklist', '/FO', 'CSV', '/NH'], creationflags=0x08000000, timeout=20).decode('utf-8', 'ignore')
+    except Exception:
+        out = ''
+    k32 = ctypes.windll.kernel32
+    for ln in out.splitlines():
+        p = ln.split('","')
+        if len(p) < 2 or not p[0].strip('"').lower().startswith('aiwidgetdock'):
+            continue
+        try:
+            pid = int(p[1].strip('"'))
+        except ValueError:
+            continue
+        if pid in (me, os.getppid()):   # собранный exe — это два процесса: загрузчик (родитель) и сама программа
+            continue
+        path = ''
+        hp = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if hp:
+            buf = ctypes.create_unicode_buffer(1024); n = wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(n)):
+                path = buf.value
+            k32.CloseHandle(hp)
+        if '\\programs\\aiwidgetdock\\' in path.lower():   # чужую старую программу 1.0.0 (установщик PC Organazer) не трогаем
+            continue
+        if path and os.path.normcase(path) == os.path.normcase(sys.executable):   # свой же файл (загрузчик) — не трогаем
+            continue
+        subprocess.run(['taskkill', '/F', '/PID', str(pid)], creationflags=0x08000000, timeout=15)
+        log('killed old instance %d %s' % (pid, path))
+
+
+def _relocate():
+    """Собранная программа живёт в одной постоянной папке (%LOCALAPPDATA%\\Programs\\AIWidgetDock_Widget).
+    Запуск exe из любого другого места (загрузки, флешка, папка с версиями) копирует его туда и запускает оттуда.
+    Так автозапуск, ярлыки и обновления всегда ведут на один файл, и виджет не теряется."""
+    if not getattr(sys, 'frozen', False) or '--here' in sys.argv:
+        return False
+    if os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(INSTALL_EXE):
+        return False
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        for i in range(10):
+            try:
+                shutil.copy2(sys.executable, INSTALL_EXE); break
+            except PermissionError:
+                time.sleep(1)
+        env = {k: v for k, v in os.environ.items() if not (k.startswith('_PYI') or k == '_MEIPASS2')}
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+        subprocess.Popen([INSTALL_EXE], cwd=INSTALL_DIR, env=env, creationflags=0x00000008)   # DETACHED_PROCESS
+        log('relocated %s -> %s' % (sys.executable, INSTALL_EXE))
+        return True
+    except Exception as ex:
+        log('relocate: %r' % ex)
+        return False
+
+
 def main():
     install_crash_guards()
     app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
     import ctypes
-    ctypes.windll.kernel32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
-    if ctypes.windll.kernel32.GetLastError() == 183:
+    if _is_new_build():
+        if _ask_running_to_show(b'quit'):   # работает старая установленная версия — она закроется, новая встанет на её место
+            log('asked running instance to quit (new build %s)' % VERSION); time.sleep(3)
+    elif _ask_running_to_show():
         return
+    k32 = ctypes.windll.kernel32
+    h = k32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
+    if k32.GetLastError() == 183:   # мьютекс держит старая версия без «показаться» — закрываем её
+        k32.CloseHandle(h); _kill_old_instances(); time.sleep(1.5)
+        h = k32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
+        if k32.GetLastError() == 183 and _ask_running_to_show():
+            return
+    if getattr(sys, 'frozen', False) and '--here' not in sys.argv and os.path.normcase(os.path.abspath(sys.executable)) != os.path.normcase(INSTALL_EXE):
+        k32.CloseHandle(h)   # копия в постоянной папке должна сама занять мьютекс
+        if _relocate():
+            return
+        h = k32.CreateMutexW(None, False, 'Global\\AIWidgetDock')
+    log('start %s %s' % (VERSION, sys.executable))
+    from PyQt6.QtNetwork import QLocalServer
+    srv = QLocalServer(); QLocalServer.removeServer(IPC_NAME); srv.listen(IPC_NAME)
     d = Dock(); d._ready = True; d.relayout()
+
+    def on_conn():
+        c = srv.nextPendingConnection()
+        data = b''
+        if c:
+            if c.waitForReadyRead(800):
+                data = bytes(c.readAll())
+            c.disconnected.connect(c.deleteLater)
+        if data.startswith(b'quit'):
+            log('quit: replaced by another build'); d._quitting = True; QApplication.quit()
+        else:
+            d.bus.show_req.emit()
+    srv.newConnection.connect(on_conn); d._srv = srv
+    app.aboutToQuit.connect(lambda: log('quit'))
+    QTimer.singleShot(2500, d.show_whatsnew)
     try:   # отметка «запустился»: по ней установщик понимает, что новая версия работает
         with open(os.path.join(DATA, 'started.flag'), 'w', encoding='utf-8') as f:
             f.write(VERSION)

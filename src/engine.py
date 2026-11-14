@@ -319,7 +319,45 @@ def launch_cdp_chrome(port, profile, visible=False):
                      creationflags=subprocess.CREATE_NO_WINDOW)
 
 
+_CDP_RELOAD_AT = {}
+
+
+def cdp_reload_tab(port):
+    """Перезагрузить вкладку claude.ai в браузере виджета (не чаще раза в 90 с на порт)."""
+    import websocket as _ws
+    if time.time() - _CDP_RELOAD_AT.get(port, 0) < 90:
+        return False
+    _CDP_RELOAD_AT[port] = time.time()
+    try:
+        tabs = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{port}/json', timeout=2).read())
+        tab = next((t for t in tabs if t.get('type') == 'page' and t.get('url', '').startswith('https://claude.ai')), None)
+        if not tab:
+            return False
+        c = _ws.create_connection(tab['webSocketDebuggerUrl'], timeout=5)
+        try:
+            c.send(json.dumps({'id': 9, 'method': 'Page.reload', 'params': {'ignoreCache': True}}))
+            c.recv()
+        finally:
+            c.close()
+        time.sleep(6)
+        return True
+    except Exception:
+        return False
+
+
 def cdp_fetch_json(port, path, timeout=8):
+    """Запрос через браузер виджета. Если вкладка «зависла» (таймаут) — сама перезагружает её и повторяет один раз."""
+    try:
+        return _cdp_fetch_once(port, path, timeout)
+    except urllib.error.HTTPError:
+        raise
+    except Exception:
+        if cdp_reload_tab(port):
+            return _cdp_fetch_once(port, path, timeout)
+        raise
+
+
+def _cdp_fetch_once(port, path, timeout=8):
     """Запрос к claude.ai изнутри браузера виджета — свои куки и Cloudflare-допуск, без 403."""
     import websocket as _ws
     tabs = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{port}/json', timeout=2).read())
@@ -330,7 +368,7 @@ def cdp_fetch_json(port, path, timeout=8):
         time.sleep(4)
     c = _ws.create_connection(tab['webSocketDebuggerUrl'], timeout=timeout)
     try:
-        expr = ("fetch(%s,{credentials:'include'}).then(async r=>JSON.stringify({s:r.status,b:await r.text()}))"
+        expr = ("fetch(%s,{credentials:'include',signal:AbortSignal.timeout(7000)}).then(async r=>JSON.stringify({s:r.status,b:await r.text()}))"
                 % json.dumps('https://claude.ai' + path))
         c.send(json.dumps({'id': 7, 'method': 'Runtime.evaluate',
                            'params': {'expression': expr, 'awaitPromise': True, 'returnByValue': True}}))
